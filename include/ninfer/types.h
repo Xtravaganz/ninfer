@@ -139,6 +139,13 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Opt-in retention policy for ONE long-lived conversation whose prompt only ever grows.
+    // A capture that the current request has proven to extend a resident checkpoint -- an exact
+    // shortlist-key match at that resident's frontier -- inherits the resident's demonstrated
+    // demand, so rolling the frontier forward is value-positive instead of competing against
+    // its own history. Off by default: when concurrent conversations share a prefix, this lets
+    // one conversation's extension evict the prefix the others depend on.
+    bool rolling_retention = false;
 };
 
 struct ContextCostOptions {

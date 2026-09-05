@@ -99,13 +99,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              *cache.max_long_anchors_per_continuation != 0)) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
-        cache.device_state_slots                = 0;
-        cache.host_state_slots                  = 0;
-        cache.host_kv_capacity_bytes            = 0;
-        cache.max_private_continuations         = concurrency;
-        cache.max_shared_prefixes               = 0;
-        cache.max_long_anchors_per_continuation = 0;
-        return options;
+	cache.device_state_slots                = 0;
+	cache.host_state_slots                  = 0;
+	cache.host_kv_capacity_bytes            = 0;
+	cache.max_private_continuations         = concurrency;
+	cache.max_shared_prefixes               = 0;
+	cache.max_long_anchors_per_continuation = 0;
+	cache.rolling_retention                 = false;
+	return options;
     }
 
     cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);

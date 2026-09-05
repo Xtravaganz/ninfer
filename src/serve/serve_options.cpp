@@ -76,6 +76,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
+           "[--context-cache-policy default|rolling] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -234,6 +235,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
+        } else if (arg == "--context-cache-policy") {
+            const std::string policy = require_value("--context-cache-policy");
+            if (policy == "rolling") {
+                options.context_cache.rolling_retention = true;
+            } else if (policy == "default") {
+                options.context_cache.rolling_retention = false;
+            } else {
+                throw std::invalid_argument(
+                    "--context-cache-policy must be 'default' or 'rolling'");
+            }
         } else if (arg == "--max-long-anchors-per-continuation") {
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),

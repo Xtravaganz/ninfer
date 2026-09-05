@@ -771,7 +771,8 @@ public:
                             : std::optional<PlanningOwnerId>(owner_id_for(
                                   LogicalOwnerKind::SharedPrefix, scenario.publication_slot)),
                     .candidate_demand_mask =
-                        committed_demand_mask_for(scenario.assessment.shortlist_key),
+                        committed_demand_mask_for(scenario.assessment.shortlist_key) |
+                        rolling_inherited_demand(lane),
                     .candidate_rebuild_ns =
                         cost_model_.prefill_ns(scenario.assessment.protected_rebuild_work),
                     .private_baseline_immediate_ns = price_context_transfer_requirements(
@@ -1114,6 +1115,30 @@ public:
                                            ? std::numeric_limits<std::uint32_t>::max()
                                            : static_cast<std::uint32_t>(shared_references);
     }
+
+    // Opt in to rolling retention. See ContextCacheOptions::rolling_retention.
+    void enable_rolling_retention() noexcept { rolling_retention_ = true; }
+
+    // Rolling retention: the demand a capture inherits from the residents the current request
+    // has proven it extends. A request's committed demand record lists every resident key it
+    // matched exactly at that resident's frontier; the capture at the prompt's end frontier is
+    // therefore a strict extension of each. In a monotonic conversation every past request that
+    // wanted an ancestor wants its descendant next, so the ancestor's demand is the descendant's.
+    // A capture that matched nothing inherits nothing and is valued exactly as before.
+    [[nodiscard]] std::uint32_t rolling_inherited_demand(LaneId lane) const noexcept {
+        if (!rolling_retention_ || lane.value >= lane_count_) { return 0; }
+        const ActiveEntry& active  = active_[lane.value];
+        const ReuseDomainId domain = reuse_domain(active.session, active.publication_order);
+        std::uint32_t mask         = 0;
+        for (const PrefixDemandRecord& demand : demand_window_) {
+            if (demand.domain != domain) { continue; }
+            for (const PrefixShortlistKey& key : demand.exact_resident_keys) {
+                mask |= committed_demand_mask_for(key);
+            }
+        }
+        return mask;
+    }
+
 
     [[nodiscard]] CatalogState catalog_state(std::uint32_t slot) const noexcept {
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
@@ -3365,6 +3390,7 @@ private:
     std::uint32_t catalog_count_        = 0;
     std::uint32_t shared_catalog_count_ = 0;
     bool cache_enabled_                 = true;
+    bool rolling_retention_             = false;
     std::array<LogicalLaneState, kMaximumConcurrency> lanes_{};
     std::vector<CatalogEntry> catalog_;
     std::vector<SharedCatalogEntry> shared_catalog_;
