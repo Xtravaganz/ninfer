@@ -44,7 +44,7 @@ from . import recipe_nvfp4 as recipe
 from .dflash2_inventory import DFLASH2_TENSOR_SPECS
 
 
-RECIPE_ID = "qwen3_8_27b_nvfp4-mtp-a1-v1"
+RECIPE_ID = "qwen3_8_27b_nvfp4-v2"
 
 _FP8_TARGETS = [
     r"re:.*self_attn\.(q|k|v|o)_proj$",
@@ -60,13 +60,10 @@ class ConversionPreflight:
     official_dir: Path
     quantized_dir: Path
     dflash2_model_dir: Path
-    mtp_a1_dir: Path
     base_config_summary: dict[str, object]
     dflash2_config_summary: dict[str, object]
     official_source: family_recipe.SourcePreflight
     quantized_source: family_recipe.SourcePreflight
-    mtp_a1_source: family_recipe.SourcePreflight
-    mtp_a1_summary: dict[str, object]
     dflash2_source: family_recipe.SourcePreflight
     resources: tuple[family_conversion.ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
@@ -197,68 +194,6 @@ def _validate_quantized_config(
     return summary
 
 
-def _validate_mtp_a1_summary(calibration_dir: Path) -> dict[str, object]:
-    summary_path = calibration_dir / "calibration-summary.json"
-    packed_path = calibration_dir / recipe.MTP_A1_PACKED_FILENAME
-    if not summary_path.is_file():
-        raise ValueError(f"missing MTP A1 summary: {summary_path}")
-    if not packed_path.is_file() or packed_path.stat().st_size == 0:
-        raise ValueError(f"missing MTP A1 packed source: {packed_path}")
-
-    summary = family_conversion.load_json(summary_path)
-    expected = {
-        "format": "ninfer-mtp-a1-nvfp4-calibration-v2",
-        "sample_count": 256,
-        "source_tokens": 2064538,
-        "calibration_tokens": 2064282,
-        "alignment": "target_hidden[t] <-> token_id[t+1] at MTP position t",
-        "hidden_semantic": "NInfer target final-RMSNorm output",
-    }
-    for key, value in expected.items():
-        if summary.get(key) != value:
-            raise ValueError(
-                f"{summary_path}: {key}={summary.get(key)!r} != {value!r}"
-            )
-    if summary.get("samples") != list(range(256)):
-        raise ValueError(f"{summary_path}: samples must be exactly 0..255")
-
-    gate_up = summary.get("gate_up")
-    if not isinstance(gate_up, Mapping):
-        raise ValueError(f"{summary_path}: missing gate_up report")
-    for key in (
-        "weight_global_scale_bit_identical",
-        "input_global_scale_bit_identical",
-        "direct_ninfer_gate_up_fusable",
-    ):
-        if gate_up.get(key) is not True:
-            raise ValueError(f"{summary_path}: gate_up.{key} must be true")
-
-    qparams = summary.get("qparams")
-    if not isinstance(qparams, Mapping):
-        raise ValueError(f"{summary_path}: missing qparams")
-    expected_words = {
-        "mtp.layers.0.mlp.gate_proj": ("0x45e739ce", "0x4246318c"),
-        "mtp.layers.0.mlp.up_proj": ("0x45e739ce", "0x4246318c"),
-        "mtp.layers.0.mlp.down_proj": ("0x453e4d07", "0x40b1b810"),
-    }
-    for name, (weight_word, input_word) in expected_words.items():
-        item = qparams.get(name)
-        if not isinstance(item, Mapping):
-            raise ValueError(f"{summary_path}: missing qparams[{name!r}]")
-        if item.get("weight_global_scale_fp32_word") != weight_word:
-            raise ValueError(f"{summary_path}: {name} weight divisor word mismatch")
-        if item.get("input_global_scale_fp32_word") != input_word:
-            raise ValueError(f"{summary_path}: {name} input divisor word mismatch")
-
-    packed_file = summary.get("packed_file")
-    if not isinstance(packed_file, str) or Path(packed_file).name != recipe.MTP_A1_PACKED_FILENAME:
-        raise ValueError(f"{summary_path}: packed_file does not name the expected file")
-    packed_tensors = summary.get("packed_tensors")
-    if not isinstance(packed_tensors, Mapping) or frozenset(packed_tensors) != recipe.MTP_A1_EXPECTED_FIELDS:
-        raise ValueError(f"{summary_path}: packed_tensors field set is not closed")
-    return dict(summary)
-
-
 def preflight_inventory() -> None:
     inventory.validate_inventory()
     recipe.validate_recipe()
@@ -276,13 +211,10 @@ def preflight_conversion(
     official_dir: str | Path,
     quantized_dir: str | Path,
     dflash2_model_dir: str | Path,
-    mtp_a1_calibration_dir: str | Path,
 ) -> ConversionPreflight:
     official = Path(official_dir)
     quantized = Path(quantized_dir)
     dflash2_model = Path(dflash2_model_dir)
-    mtp_a1_dir = Path(mtp_a1_calibration_dir)
-    mtp_a1_summary = _validate_mtp_a1_summary(mtp_a1_dir)
     _validate_index(official)
     _validate_index(quantized)
 
@@ -307,10 +239,6 @@ def preflight_conversion(
         official_source = recipe.preflight_official_sources(official_reader)
     with ShardReader(quantized) as quantized_reader:
         quantized_source = recipe.preflight_quantized_metadata(quantized_reader)
-    with ShardReader.from_file(
-        mtp_a1_dir / recipe.MTP_A1_PACKED_FILENAME
-    ) as mtp_a1_reader:
-        mtp_a1_source = recipe.preflight_mtp_a1_metadata(mtp_a1_reader)
     dflash2_source = dflash2_recipe.preflight_sources(dflash2_model)
 
     resources = base_convert.load_resources(official)
@@ -322,13 +250,10 @@ def preflight_conversion(
         official_dir=official,
         quantized_dir=quantized,
         dflash2_model_dir=dflash2_model,
-        mtp_a1_dir=mtp_a1_dir,
         base_config_summary=official_summary,
         dflash2_config_summary=dflash2_summary,
         official_source=official_source,
         quantized_source=quantized_source,
-        mtp_a1_source=mtp_a1_source,
-        mtp_a1_summary=mtp_a1_summary,
         dflash2_source=dflash2_source,
         resources=resources,
         draft=draft,
@@ -425,13 +350,6 @@ def _build_report(
             "revision": dflash2_recipe.REVISION,
             "model_path": str(preflight.dflash2_model_dir.resolve()),
         },
-        "mtp_a1": {
-            "calibration_dir": str(preflight.mtp_a1_dir.resolve()),
-            "format": preflight.mtp_a1_summary["format"],
-            "sample_count": preflight.mtp_a1_summary["sample_count"],
-            "source_tokens": preflight.mtp_a1_summary["source_tokens"],
-            "calibration_tokens": preflight.mtp_a1_summary["calibration_tokens"],
-        },
         "ranking_path": str(ranking.resolve()),
     }
     report["source_preflight"] = {
@@ -449,12 +367,6 @@ def _build_report(
             "source_fp8_matrices": len(recipe.FP8_SOURCES),
             "source_nvfp4_matrices": len(recipe.NVFP4_SOURCES),
         },
-        "mtp_a1": {
-            "recipes": preflight.mtp_a1_source.recipe_count,
-            "tensors": preflight.mtp_a1_source.source_tensor_count,
-            "shards": preflight.mtp_a1_source.source_shard_count,
-            "dtypes": dict(preflight.mtp_a1_source.source_dtype_counts),
-        },
         "dflash2": {
             "recipes": preflight.dflash2_source.recipe_count,
             "tensors": preflight.dflash2_source.source_tensor_count,
@@ -470,7 +382,6 @@ def convert(
     official_dir: str | Path,
     quantized_dir: str | Path,
     dflash2_model_dir: str | Path,
-    mtp_a1_calibration_dir: str | Path,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
@@ -482,14 +393,13 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     preflight = preflight_conversion(
-        official_dir, quantized_dir, dflash2_model_dir, mtp_a1_calibration_dir
+        official_dir, quantized_dir, dflash2_model_dir
     )
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
         f"{len(recipe.FP8_SOURCES)} FP8 and "
         f"{len(recipe.NVFP4_SOURCES)} NVFP4 source matrices, "
-        f"{preflight.mtp_a1_source.source_tensor_count} MTP A1 fields, "
         f"{preflight.dflash2_source.source_tensor_count} DFlash2 source tensors, "
         f"device={resolved_device}",
         flush=True,
@@ -517,9 +427,7 @@ def convert(
 
         with ShardReader(preflight.official_dir) as official_reader, ShardReader(
             preflight.quantized_dir
-        ) as quantized_reader, ShardReader.from_file(
-            preflight.mtp_a1_dir / recipe.MTP_A1_PACKED_FILENAME
-        ) as mtp_a1_reader:
+        ) as quantized_reader:
             for spec in inventory.BASE_TENSOR_SPECS:
                 index += 1
                 payload: bytes | Iterable[bytes]
@@ -537,18 +445,6 @@ def convert(
                     scalar = recipe.materialize_input_divisor(
                         recipe.INPUT_DIVISORS_BY_NAME[spec.name],
                         quantized_reader,
-                    )
-                    payload = encode_direct(scalar, inventory.FP32)
-                elif spec.name in recipe.MTP_A1_WEIGHTS_BY_NAME:
-                    selected = recipe.MTP_A1_WEIGHTS_BY_NAME[spec.name]
-                    packed, scales, divisor = recipe.materialize_nvfp4_weight(
-                        selected, mtp_a1_reader
-                    )
-                    payload = encode_nvfp4(packed, scales, divisor, spec.shape)
-                elif spec.name in recipe.MTP_A1_INPUT_DIVISORS_BY_NAME:
-                    scalar = recipe.materialize_input_divisor(
-                        recipe.MTP_A1_INPUT_DIVISORS_BY_NAME[spec.name],
-                        mtp_a1_reader,
                     )
                     payload = encode_direct(scalar, inventory.FP32)
                 elif spec.name in recipe.QUANTIZED_DIRECT_BY_NAME:
@@ -592,7 +488,6 @@ def convert(
         "model": str(official_dir),
         "quantized_model": str(quantized_dir),
         "dflash2_model": str(dflash2_model_dir),
-        "mtp_a1_calibration_dir": str(mtp_a1_calibration_dir),
         "out": str(out_path),
         "device": requested_device,
     }
@@ -621,7 +516,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--quantized-model", required=True, type=Path)
     parser.add_argument("--dflash2-model", required=True, type=Path)
-    parser.add_argument("--mtp-a1-calibration-dir", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args(argv)
@@ -629,7 +523,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         arguments.model,
         arguments.quantized_model,
         arguments.dflash2_model,
-        arguments.mtp_a1_calibration_dir,
         arguments.out,
         device=arguments.device,
     )

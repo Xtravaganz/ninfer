@@ -1,5 +1,3 @@
-#include <cstdlib>
-#include <fstream>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -92,69 +90,6 @@ Tensor matrix_window(Tensor& t, std::int32_t cols) {
         throw std::invalid_argument("matrix_window shape mismatch");
     }
     return t.slice(1, 0, cols);
-}
-
-void maybe_dump_mtp_calibration_chunk(std::span<const int> ids,
-                                      int t0,
-                                      std::uint32_t prompt_t0,
-                                      const Tensor& hidden,
-                                      cudaStream_t stream) {
-    const char* path = std::getenv("NINFER_MTP_CAL_DUMP");
-    if (path == nullptr || *path == '\0') { return; }
-
-    if (hidden.dtype != DType::BF16 || hidden.ne[0] != 5120 || hidden.ne[1] <= 0) {
-        throw std::runtime_error("MTP calibration dump: invalid hidden tensor");
-    }
-
-    const std::uint32_t len = static_cast<std::uint32_t>(hidden.ne[1]);
-    if (t0 < 0 || static_cast<std::size_t>(t0) + len > ids.size()) {
-        throw std::runtime_error("MTP calibration dump: token range invalid");
-    }
-
-    constexpr std::uint32_t kMagic   = 0x4D545043; // "MTPC"
-    constexpr std::uint32_t kVersion = 1;
-    constexpr std::uint32_t kHidden  = 5120;
-
-    std::vector<std::uint16_t> host_hidden(
-        static_cast<std::size_t>(kHidden) * len
-    );
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        host_hidden.data(),
-        hidden.data,
-        host_hidden.size() * sizeof(std::uint16_t),
-        cudaMemcpyDeviceToHost,
-        stream
-    ));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::ofstream out(path, std::ios::binary | std::ios::app);
-    if (!out) {
-        throw std::runtime_error("MTP calibration dump: cannot open output file");
-    }
-
-    out.write(reinterpret_cast<const char*>(&kMagic), sizeof(kMagic));
-    out.write(reinterpret_cast<const char*>(&kVersion), sizeof(kVersion));
-    out.write(reinterpret_cast<const char*>(&prompt_t0), sizeof(prompt_t0));
-    out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-    out.write(reinterpret_cast<const char*>(&kHidden), sizeof(kHidden));
-
-    for (std::uint32_t i = 0; i < len; ++i) {
-        const std::int32_t id =
-            static_cast<std::int32_t>(ids[static_cast<std::size_t>(t0) + i]);
-        out.write(reinterpret_cast<const char*>(&id), sizeof(id));
-    }
-
-    out.write(
-        reinterpret_cast<const char*>(host_hidden.data()),
-        static_cast<std::streamsize>(
-            host_hidden.size() * sizeof(std::uint16_t)
-        )
-    );
-
-    if (!out) {
-        throw std::runtime_error("MTP calibration dump: write failed");
-    }
 }
 
 class ScopedPositions {
@@ -1270,8 +1205,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
-
-	    maybe_dump_mtp_calibration_chunk(ids, t0, prompt_t0, xf, s);
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);

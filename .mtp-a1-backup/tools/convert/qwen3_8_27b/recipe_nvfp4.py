@@ -22,17 +22,6 @@ QUANTIZED_REPOSITORY = "unsloth/Qwen3.8-27B-NVFP4"
 QUANTIZED_REVISION = "60e813d4dbbdc5d64cf3f5a8caf2897bedf03679"
 
 
-MTP_A1_OBJECT_NAMES = frozenset(
-    (
-        "mtp/layer/mlp/gate_up",
-        "mtp/layer/mlp/gate_up_projection/input_scale_divisor",
-        "mtp/layer/mlp/down",
-        "mtp/layer/mlp/down_projection/input_scale_divisor",
-    )
-)
-MTP_A1_PACKED_FILENAME = "mtp-a1-nvfp4-separate-projections.safetensors"
-
-
 @dataclass(frozen=True, slots=True)
 class RowRange:
     begin: int
@@ -101,43 +90,6 @@ def _q_part(source: MatrixSource, gate: bool) -> MatrixPart:
             for head in range(24)
         ),
     )
-
-
-MTP_A1_GATE_SOURCE = _source("mtp.layers.0.mlp.gate_proj", 17408, 5120)
-MTP_A1_UP_SOURCE = _source("mtp.layers.0.mlp.up_proj", 17408, 5120)
-MTP_A1_DOWN_SOURCE = _source("mtp.layers.0.mlp.down_proj", 5120, 17408)
-MTP_A1_SOURCES = (MTP_A1_GATE_SOURCE, MTP_A1_UP_SOURCE, MTP_A1_DOWN_SOURCE)
-
-MTP_A1_WEIGHT_RECIPES = (
-    Nvfp4WeightRecipe(
-        "mtp/layer/mlp/gate_up",
-        (34816, 5120),
-        (_all(MTP_A1_GATE_SOURCE), _all(MTP_A1_UP_SOURCE)),
-        (MTP_A1_GATE_SOURCE, MTP_A1_UP_SOURCE),
-    ),
-    Nvfp4WeightRecipe(
-        "mtp/layer/mlp/down",
-        (5120, 17408),
-        (_all(MTP_A1_DOWN_SOURCE),),
-        (MTP_A1_DOWN_SOURCE,),
-    ),
-)
-MTP_A1_WEIGHTS_BY_NAME = {item.object_name: item for item in MTP_A1_WEIGHT_RECIPES}
-MTP_A1_INPUT_DIVISOR_RECIPES = (
-    InputDivisorRecipe(
-        "mtp/layer/mlp/gate_up_projection/input_scale_divisor",
-        (MTP_A1_GATE_SOURCE, MTP_A1_UP_SOURCE),
-        ("mtp/layer/mlp/gate_up",),
-    ),
-    InputDivisorRecipe(
-        "mtp/layer/mlp/down_projection/input_scale_divisor",
-        (MTP_A1_DOWN_SOURCE,),
-        ("mtp/layer/mlp/down",),
-    ),
-)
-MTP_A1_INPUT_DIVISORS_BY_NAME = {
-    item.object_name: item for item in MTP_A1_INPUT_DIVISOR_RECIPES
-}
 
 
 def _build_quantized_matrix_recipes() -> tuple[
@@ -438,24 +390,6 @@ def _build_quantized_direct_recipes() -> tuple[family_recipe.TensorRecipe, ...]:
     INPUT_DIVISOR_RECIPES,
     WEIGHT_DIVISOR_GROUPS,
 ) = _build_quantized_matrix_recipes()
-
-# MTP Hybrid-A1 is sourced from the dedicated calibrated safetensors file,
-# not from the normal --quantized-model source.
-NVFP4_WEIGHT_RECIPES = tuple(
-    item
-    for item in NVFP4_WEIGHT_RECIPES
-    if item.object_name not in MTP_A1_OBJECT_NAMES
-)
-INPUT_DIVISOR_RECIPES = tuple(
-    item
-    for item in INPUT_DIVISOR_RECIPES
-    if item.object_name not in MTP_A1_OBJECT_NAMES
-)
-WEIGHT_DIVISOR_GROUPS = tuple(
-    group
-    for group in WEIGHT_DIVISOR_GROUPS
-    if not any(source.name.startswith("mtp.") for source in group)
-)
 FP8_WEIGHTS_BY_NAME = {item.object_name: item for item in FP8_WEIGHT_RECIPES}
 NVFP4_WEIGHTS_BY_NAME = {
     item.object_name: item for item in NVFP4_WEIGHT_RECIPES
@@ -502,7 +436,7 @@ OFFICIAL_TENSOR_SPECS = tuple(
     if (
         spec.name == "text/token_embedding"
         or spec.name.startswith("text/draft_head")
-        or (spec.name.startswith("mtp/") and spec.name not in MTP_A1_OBJECT_NAMES)
+        or spec.name.startswith("mtp/")
         or spec.name.startswith("vision/")
     )
     and spec.name not in MTP_NVFP4_OBJECT_NAMES
@@ -543,31 +477,17 @@ def validate_recipe() -> None:
         OFFICIAL_RECIPES, OFFICIAL_TENSOR_SPECS
     )
     ownership = (
-        ("embedding", {"text/token_embedding"}),
-        ("fp8", set(FP8_WEIGHTS_BY_NAME)),
-        ("nvfp4", set(NVFP4_WEIGHTS_BY_NAME)),
-        ("input_divisors", set(INPUT_DIVISORS_BY_NAME)),
-        ("quantized_direct", set(QUANTIZED_DIRECT_BY_NAME)),
-        ("mtp_a1", set(MTP_A1_OBJECT_NAMES)),
-        (
-            "official",
-            set(OFFICIAL_RECIPES_BY_NAME).difference({"text/token_embedding"}),
-        ),
+        {"text/token_embedding"},
+        set(FP8_WEIGHTS_BY_NAME),
+        set(NVFP4_WEIGHTS_BY_NAME),
+        set(INPUT_DIVISORS_BY_NAME),
+        set(QUANTIZED_DIRECT_BY_NAME),
+        set(OFFICIAL_RECIPES_BY_NAME).difference({"text/token_embedding"}),
     )
     all_names: set[str] = set()
-    previous_routes: dict[str, str] = {}
-    for route, names in ownership:
-        overlap = all_names.intersection(names)
-        if overlap:
-            details = {
-                name: (previous_routes[name], route)
-                for name in sorted(overlap)
-            }
-            raise ValueError(
-                f"source-route ownership collision: {details}"
-            )
-        for name in names:
-            previous_routes[name] = route
+    for names in ownership:
+        if all_names.intersection(names):
+            raise ValueError("more than one source route owns an artifact tensor")
         all_names.update(names)
     if all_names != {spec.name for spec in inventory.BASE_TENSOR_SPECS}:
         raise ValueError("source routes do not cover the base tensor inventory")
@@ -578,15 +498,11 @@ def validate_recipe() -> None:
     ):
         raise ValueError("FP8 recipe order does not match inventory")
     if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
-        spec.name
-        for spec in inventory.NVFP4_TENSOR_SPECS
-        if spec.name not in MTP_A1_OBJECT_NAMES
+        spec.name for spec in inventory.NVFP4_TENSOR_SPECS
     ):
         raise ValueError("NVFP4 recipe order does not match inventory")
     if tuple(INPUT_DIVISORS_BY_NAME) != tuple(
-        spec.name
-        for spec in inventory.INPUT_SCALE_DIVISOR_SPECS
-        if spec.name not in MTP_A1_OBJECT_NAMES
+        spec.name for spec in inventory.INPUT_SCALE_DIVISOR_SPECS
     ):
         raise ValueError("input-divisor recipe order does not match inventory")
     for recipe in FP8_WEIGHT_RECIPES:
@@ -601,20 +517,6 @@ def validate_recipe() -> None:
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents once")
-
-    mtp_a1_owned = set(MTP_A1_WEIGHTS_BY_NAME) | set(MTP_A1_INPUT_DIVISORS_BY_NAME)
-    if mtp_a1_owned != MTP_A1_OBJECT_NAMES:
-        raise ValueError("MTP A1 source route does not own exactly four artifact objects")
-    for item in MTP_A1_WEIGHT_RECIPES:
-        _validate_matrix_recipe(item.object_name, item.shape, item.parts)
-    mtp_a1_bound = tuple(
-        name for site in MTP_A1_INPUT_DIVISOR_RECIPES for name in site.weight_names
-    )
-    if (
-        len(mtp_a1_bound) != len(set(mtp_a1_bound))
-        or set(mtp_a1_bound) != set(MTP_A1_WEIGHTS_BY_NAME)
-    ):
-        raise ValueError("MTP A1 input-divisor sites do not cover parents once")
 
 
 def _merge_requirement(
@@ -659,72 +561,11 @@ def _source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 SOURCE_REQUIREMENTS = _source_requirements()
-def _mtp_a1_source_requirements() -> dict[str, tuple[tuple[int, ...], str]]:
-    result: dict[str, tuple[tuple[int, ...], str]] = {}
-    for source in MTP_A1_SOURCES:
-        n, k = source.shape
-        _merge_requirement(
-            result, source.field("weight_packed"), (n, k // 2), "U8"
-        )
-        _merge_requirement(
-            result, source.field("weight_scale"), (n, k // 16), "F8_E4M3"
-        )
-        _merge_requirement(
-            result, source.field("weight_global_scale"), (1,), "F32"
-        )
-        _merge_requirement(
-            result, source.field("input_global_scale"), (1,), "F32"
-        )
-    return result
-
-
-MTP_A1_SOURCE_REQUIREMENTS = _mtp_a1_source_requirements()
-MTP_A1_EXPECTED_FIELDS = frozenset(MTP_A1_SOURCE_REQUIREMENTS)
-
-
 EXPECTED_QUANTIZED_FIELDS = frozenset(
     name
     for name, (_, dtype) in SOURCE_REQUIREMENTS.items()
     if dtype in ("F8_E4M3", "F32", "U8")
 )
-
-
-def preflight_mtp_a1_metadata(
-    reader: ShardReader,
-) -> family_recipe.SourcePreflight:
-    actual_fields = frozenset(reader.names)
-    if actual_fields != MTP_A1_EXPECTED_FIELDS:
-        unexpected = actual_fields.difference(MTP_A1_EXPECTED_FIELDS)
-        missing = MTP_A1_EXPECTED_FIELDS.difference(actual_fields)
-        detail = sorted(unexpected)[0] if unexpected else sorted(missing)[0]
-        raise ValueError(f"MTP A1 packed source allocation is not closed: {detail}")
-
-    metadata = reader.metadata(reader.names)
-    dtype_counts: dict[str, int] = {}
-    for name, (shape, dtype) in MTP_A1_SOURCE_REQUIREMENTS.items():
-        actual = metadata[name]
-        if actual.shape != shape or actual.dtype != dtype:
-            raise ValueError(
-                f"{name}: MTP A1 source signature {(actual.shape, actual.dtype)} "
-                f"!= {(shape, dtype)}"
-            )
-        dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
-
-    _same_divisor(
-        reader, (MTP_A1_GATE_SOURCE, MTP_A1_UP_SOURCE), "weight_global_scale"
-    )
-    _same_divisor(
-        reader, (MTP_A1_GATE_SOURCE, MTP_A1_UP_SOURCE), "input_global_scale"
-    )
-    _same_divisor(reader, (MTP_A1_DOWN_SOURCE,), "weight_global_scale")
-    _same_divisor(reader, (MTP_A1_DOWN_SOURCE,), "input_global_scale")
-
-    return family_recipe.SourcePreflight(
-        recipe_count=len(MTP_A1_WEIGHT_RECIPES) + len(MTP_A1_INPUT_DIVISOR_RECIPES),
-        source_tensor_count=len(MTP_A1_SOURCE_REQUIREMENTS),
-        source_shard_count=1,
-        source_dtype_counts=dtype_counts,
-    )
 
 
 def preflight_quantized_metadata(
@@ -957,15 +798,6 @@ validate_recipe()
 
 
 __all__ = [
-    "MTP_A1_EXPECTED_FIELDS",
-    "MTP_A1_INPUT_DIVISOR_RECIPES",
-    "MTP_A1_INPUT_DIVISORS_BY_NAME",
-    "MTP_A1_OBJECT_NAMES",
-    "MTP_A1_PACKED_FILENAME",
-    "MTP_A1_SOURCE_REQUIREMENTS",
-    "MTP_A1_SOURCES",
-    "MTP_A1_WEIGHT_RECIPES",
-    "MTP_A1_WEIGHTS_BY_NAME",
     "BASE_REPOSITORY",
     "BASE_REVISION",
     "EXPECTED_QUANTIZED_FIELDS",
@@ -993,7 +825,6 @@ __all__ = [
     "materialize_nvfp4_weight",
     "materialize_official",
     "materialize_quantized_direct",
-    "preflight_mtp_a1_metadata",
     "preflight_official_sources",
     "preflight_quantized_metadata",
     "validate_recipe",

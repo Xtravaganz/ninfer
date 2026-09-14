@@ -582,31 +582,19 @@ if (mtp_gate_up_nvfp4) {
         "mtp/layer/mlp/down_projection/input_scale_divisor",
         mtp_placement);
 } else {
-    const bool has_mtp_a1_gate_up =
-        binder.contains("mtp/layer/mlp/gate_up_projection/input_scale_divisor");
-    const bool has_mtp_a1_down =
-        binder.contains("mtp/layer/mlp/down_projection/input_scale_divisor");
-    if (has_mtp_a1_gate_up != has_mtp_a1_down) {
-        throw artifact::ArtifactError(
-            "partial MTP A1 artifact: both MLP input divisors must be present");
-    }
-    if (has_mtp_a1_gate_up) {
-        out.mtp.mlp.gate_up = bind_nvfp4_weight(
-            binder, "mtp/layer/mlp/gate_up", 34816, 5120,
-            "mtp/layer/mlp/gate_up_projection/input_scale_divisor", mtp_placement);
-        out.mtp.mlp.down = bind_nvfp4_weight(
-            binder, "mtp/layer/mlp/down", 5120, 17408,
-            "mtp/layer/mlp/down_projection/input_scale_divisor", mtp_placement);
-    } else {
-        out.mtp.mlp.gate_up = WeightPlan{
-            .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S,
-                               {34816, 5120}),
-            .format = NumericFormat::W8G32_F16S};
-        out.mtp.mlp.down = WeightPlan{
-            .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S,
-                               {5120, 17408}),
-            .format = NumericFormat::W8G32_F16S};
-    }
+    out.mtp.mlp.gate_up = WeightPlan{
+        .object = bind_mtp(
+            "mtp/layer/mlp/gate_up",
+            NumericFormat::W8G32_F16S,
+            {34816, 5120}),
+        .format = NumericFormat::W8G32_F16S};
+
+    out.mtp.mlp.down = WeightPlan{
+        .object = bind_mtp(
+            "mtp/layer/mlp/down",
+            NumericFormat::W8G32_F16S,
+            {5120, 17408}),
+        .format = NumericFormat::W8G32_F16S};
 }
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 

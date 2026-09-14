@@ -19,8 +19,6 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1475,95 +1473,6 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
-
-        // Calibration-only exact token input.
-        // File format: raw little-endian int32 token IDs.
-        if (const char* ids_path = std::getenv("NINFER_MTP_CAL_IDS");
-            ids_path != nullptr && *ids_path != '\0') {
-            std::ifstream input(ids_path, std::ios::binary | std::ios::ate);
-            if (!input) {
-                throw std::runtime_error(
-                    std::string("failed to open NINFER_MTP_CAL_IDS: ") + ids_path);
-            }
-
-            const std::streamoff byte_count = input.tellg();
-            if (byte_count <= 0 ||
-                byte_count % static_cast<std::streamoff>(sizeof(std::int32_t)) != 0) {
-                throw std::runtime_error(
-                    "NINFER_MTP_CAL_IDS has invalid byte length");
-            }
-
-            const std::size_t count =
-                static_cast<std::size_t>(
-                    byte_count / static_cast<std::streamoff>(sizeof(std::int32_t)));
-
-            std::vector<std::int32_t> exact_ids(count);
-
-            input.seekg(0, std::ios::beg);
-            input.read(
-                reinterpret_cast<char*>(exact_ids.data()),
-                static_cast<std::streamsize>(byte_count));
-
-            if (!input) {
-                throw std::runtime_error(
-                    "failed to read NINFER_MTP_CAL_IDS");
-            }
-
-            encoded.input_ids.clear();
-            encoded.input_ids.reserve(count);
-
-            for (const std::int32_t id : exact_ids) {
-                if (id < 0 || id >= static_cast<std::int32_t>(kTokenDomain)) {
-                    throw std::runtime_error(
-                        "NINFER_MTP_CAL_IDS contains token outside model vocabulary");
-                }
-                encoded.input_ids.push_back(static_cast<int>(id));
-            }
-
-            // Calibration input is plain text-token state. The external
-            // message serialization is deliberately ignored.
-            encoded.media_token_runs.clear();
-            encoded.rewrite_checkpoint.reset();
-            encoded.rewrite_execution_frontiers.clear();
-            encoded.message_boundaries.clear();
-            encoded.cache_boundaries.clear();
-        }
-
-        // Calibration-only right truncation. Mirrors the original HF
-        // apply_chat_template(..., truncation=True, max_length=N).
-        if (const char* raw = std::getenv("NINFER_MTP_CAL_TOKENS");
-            raw != nullptr && *raw != '\0') {
-            char* end = nullptr;
-            const unsigned long long parsed = std::strtoull(raw, &end, 10);
-
-            if (end == raw || *end != '\0' || parsed == 0) {
-                throw std::invalid_argument(
-                    "NINFER_MTP_CAL_TOKENS must be a positive integer");
-            }
-
-            const std::size_t limit = static_cast<std::size_t>(parsed);
-
-            if (encoded.input_ids.size() > limit) {
-                encoded.input_ids.resize(limit);
-
-                // Boundaries beyond the truncated token stream are invalid.
-                for (auto& boundary : encoded.message_boundaries) {
-                    if (boundary && *boundary > limit) {
-                        boundary.reset();
-                    }
-                }
-                for (auto& boundary : encoded.cache_boundaries) {
-                    if (boundary && *boundary > limit) {
-                        boundary.reset();
-                    }
-                }
-
-                // Calibration does not use rewrite/checkpoint semantics.
-                encoded.rewrite_checkpoint.reset();
-                encoded.rewrite_execution_frontiers.clear();
-            }
-        }
-
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
         }

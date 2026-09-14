@@ -172,13 +172,21 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
         tensor_spec("mtp/layer/attention/key_norm", (256,), BF16),
         tensor_spec("mtp/layer/attention/output", (5120, 6144), W8),
         tensor_spec("mtp/layer/post_attention_norm", (5120,), BF16),
-        tensor_spec("mtp/layer/mlp/gate_up", (34816, 5120), NVFP4),
+        tensor_spec(
+            "mtp/layer/mlp/gate_up",
+            (34816, 5120),
+            NVFP4,
+        ),
         tensor_spec(
             "mtp/layer/mlp/gate_up_projection/input_scale_divisor",
             (),
             FP32,
         ),
-        tensor_spec("mtp/layer/mlp/down", (5120, 17408), NVFP4),
+        tensor_spec(
+            "mtp/layer/mlp/down",
+            (5120, 17408),
+            NVFP4,
+        ),
         tensor_spec(
             "mtp/layer/mlp/down_projection/input_scale_divisor",
             (),
