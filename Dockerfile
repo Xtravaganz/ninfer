@@ -40,6 +40,7 @@ RUN apt-get update \
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /src/tools/chat_templates/qwen3_8_sharp.jinja /usr/local/share/ninfer/chat_templates/qwen3_8_sharp.jinja
 
 WORKDIR /workspace
 EXPOSE 8080
