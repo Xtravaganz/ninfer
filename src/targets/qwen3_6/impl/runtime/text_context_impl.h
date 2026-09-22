@@ -1308,9 +1308,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
+    // No per-chunk hard sync. All prefill kernels, D2H/H2D/D2D copies, and the decode CUDA graphs
+    // run on the single compute stream (ctx_.stream == device.stream), which serializes them in
+    // order: chunk N+1's kernels start only after chunk N's kernels complete, so resetting and
+    // reusing the workspace arena across chunks is safe. Host bookkeeping between chunks (KV
+    // commit, state fork settlement) reads no device state. The caller performs one
+    // device.synchronize() at the end of the round before any D2H read (sampled token, MTP drafts).
+    // If prefill ever moves to a second stream, this sync must come back.
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,

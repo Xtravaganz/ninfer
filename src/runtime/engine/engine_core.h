@@ -1328,10 +1328,13 @@ private:
                              typename Package::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-        ++cumulative_stats_.host_work.prefill_units;
-        ++request->host_timing.prefill_units;
+        if (progress.processed_chunks == 0) {
+            throw std::logic_error("prefill progress reported no processed chunks");
+        }
+        cumulative_stats_.host_work.prefill_units += progress.processed_chunks;
+        request->host_timing.prefill_units += progress.processed_chunks;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-        Scheduling::consume_service_work(*request, 1);
+        Scheduling::consume_service_work(*request, progress.processed_chunks);
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }

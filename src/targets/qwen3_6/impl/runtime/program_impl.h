@@ -37,6 +37,11 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 
 using Clock = std::chrono::steady_clock;
 
+// Maximum number of prefill chunks processed per advance_prefill execution unit. Chunks are
+// serialized on the single compute stream, so the workspace arena is reset and reused across
+// chunks within one step; the caller performs one device.synchronize() at the end of the round.
+constexpr std::uint32_t kMaxPrefillChunksPerStep = 4;
+
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
@@ -7085,6 +7090,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
     PrefillProgress out;
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
+    out.processed_chunks        = step.processed_chunks;
     out.complete                = step.complete;
     out.timing                  = step.timing;
     if (step.complete) {
@@ -11435,6 +11441,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t processed_chunks        = 0;
     const auto started                    = Clock::now();
     try {
         if (staged.next_capture < staged.capture_groups.size() &&
@@ -11448,8 +11455,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;
             return runtime::PrefillStepResult{
-                .summary = summary,
-                .timing  = timing.finish(),
+                .summary          = summary,
+                .processed_chunks = 1,
+                .timing           = timing.finish(),
             };
         }
         StateImageSelectors selectors = state_selectors(sequence);
@@ -11506,8 +11514,15 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         }
 
         if (staged.cursor < staged.prompt_tokens) {
+            // Text prefill advances up to kMaxPrefillChunksPerStep chunks per execution unit; the
+            // workspace arena is reset and reused across chunks on the single compute stream. Vision
+            // prefill stays at one chunk per unit because its chunk boundaries are set by the vision
+            // use spans, and projected_service_work accounts those spans as separate units.
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                staged.vision
+                    ? std::min(prefill_chunk, staged.prompt_tokens - staged.cursor)
+                    : std::min(kMaxPrefillChunksPerStep * prefill_chunk,
+                               staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -11563,6 +11578,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }
+                ++processed_chunks;
                 if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
                 staged.cursor += result.processed_tokens;
                 processed_prompt_tokens += result.processed_tokens;
@@ -11591,6 +11607,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
+                            .processed_chunks        = processed_chunks,
                             .timing                  = timing.finish(),
                         };
                     }
@@ -11609,6 +11626,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .processed_chunks        = processed_chunks,
                     .timing                  = timing.finish(),
                 };
             }
@@ -11619,6 +11637,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else {
+            // Zero-suffix reuse samples the first token from the cached tail hidden; it executes
+            // no prefill chunk but is one service unit in projected_service_work (suffix == 0).
+            processed_chunks = 1;
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
@@ -11699,6 +11720,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             .summary = summary,
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
+            .processed_chunks        = processed_chunks,
             .complete                = true,
             .timing                  = timing.finish(),
         };

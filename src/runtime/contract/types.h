@@ -598,6 +598,9 @@ struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
+    // Number of prefill execution units (chunks) completed in this step. One per prefill chunk
+    // processed; a zero-prefill capture offer counts as one unit. Drives service-work accounting.
+    std::uint32_t processed_chunks = 0;
     bool complete                         = false;
     ExecutionTiming timing;
 };

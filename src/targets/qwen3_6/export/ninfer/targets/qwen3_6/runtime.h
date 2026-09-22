@@ -685,6 +685,9 @@ template <class Variant>
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    // Number of prefill execution units (chunks) completed in this step; drives service-work
+    // accounting and the prefill_units host-timing stat.
+    std::uint32_t processed_chunks = 0;
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
