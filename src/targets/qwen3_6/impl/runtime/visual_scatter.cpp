@@ -8,6 +8,10 @@
 namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
+// cudaMemcpyAsync from pageable host memory may block on first use per context (the driver stages
+// the copy through a pinned buffer), but that blocking is not a stable synchronization contract.
+// Callers must keep the host source alive until the next stream barrier and must not rely on the
+// copy having completed when this function returns.
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {

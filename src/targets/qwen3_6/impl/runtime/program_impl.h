@@ -39,7 +39,11 @@ using Clock = std::chrono::steady_clock;
 
 // Maximum number of prefill chunks processed per advance_prefill execution unit. Chunks are
 // serialized on the single compute stream, so the workspace arena is reset and reused across
-// chunks within one step; the caller performs one device.synchronize() at the end of the round.
+// chunks within one step. advance_prefill places a stream barrier at every real return point
+// after chunks are enqueued, so at most kMaxPrefillChunksPerStep chunks are outstanding between
+// barriers. This is a hard architectural invariant: a second CUDA stream in prefill, state-copy,
+// KV-publishing, or DFlash invalidates the arena-reuse and deferred-sync assumptions and requires
+// restoring a per-chunk barrier.
 constexpr std::uint32_t kMaxPrefillChunksPerStep = 4;
 
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
@@ -11429,6 +11433,16 @@ runtime::PrefillStepResult
 ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
                                  runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    // Barrier at every real return point after chunks are enqueued. device.synchronize() is
+    // stream-local (cudaStreamSynchronize), so this waits only for this stream's outstanding
+    // prefill work; without it, a later decode's device wait would absorb this prefill's GPU time
+    // into decode telemetry. The zero-prefill capture offer return enqueues no GPU work and skips
+    // the barrier.
+    const auto barrier = [&]() {
+        timing.begin_wait();
+        device.synchronize();
+        timing.end_wait();
+    };
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -11604,6 +11618,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
                         staged.pending_capture_offer = next_capture_offer_id_;
+                        barrier();
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
@@ -11623,6 +11638,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                barrier();
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
@@ -11673,9 +11689,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        barrier();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
