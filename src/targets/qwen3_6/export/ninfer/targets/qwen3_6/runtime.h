@@ -878,7 +878,8 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
-                    runtime::ExecutionTiming* failed_timing = nullptr);
+                    runtime::ExecutionTiming* failed_timing = nullptr,
+                    bool decode_runnable = false);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer<Variant>& offer,
                     const SharedPrefixHandle<Variant>* exact_shared,

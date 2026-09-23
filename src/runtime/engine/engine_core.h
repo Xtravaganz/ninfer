@@ -1380,7 +1380,8 @@ private:
         progress.pending.reset();
     }
 
-    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          bool decode_runnable) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto prefill_lane = scheduler_.prefill_lane();
@@ -1395,8 +1396,9 @@ private:
         }
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = instance_.program->advance_prefill(*request->sequence,
+                                                           &program_call.failed_timing(),
+                                                           decode_runnable);
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1998,7 +2000,10 @@ private:
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
+                    // When decode lanes are runnable, cap the prefill step at one chunk so decode
+                    // inter-token latency stays fair; when no decode is runnable, batch the full
+                    // prefill quantum.
+                    run_prefill_step(cancelled_at_unit_start, !membership.empty());
                     previous_unit_was_decode = false;
                     continue;
                 }
