@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -726,6 +727,131 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
     return "no_pressure";
 }
 
+// Public mirror of the runtime projection-status enum so the request log does not depend on
+// runtime/contract headers.
+enum class MaterializationProjectionStatus : std::uint8_t {
+    Feasible,
+    Infeasible,
+    StructuralInvalid,
+};
+
+// Public mirror of the runtime private-source-mode enum.
+enum class MaterializationSourceMode : std::uint8_t {
+    Retain,
+    ConsumeToActive,
+};
+
+// Compact prefix-index discovery outcome for one request. These counters separate a candidate
+// never discovered (best_reuse_prompt_tokens == 0 / shortlist failure) from a candidate that
+// reached planning but was not selected.
+struct MaterializationDiscoverySummary {
+    std::uint32_t prefix_index_entries                = 0;
+    std::uint32_t valid_prefix_index_entries          = 0;
+    std::uint32_t shortlist_matches                   = 0;
+    std::uint32_t accepted_reuse_candidates           = 0;
+    std::uint32_t best_reuse_prompt_tokens            = 0;
+    std::uint32_t rejected_invalid_prefix_index_entry = 0;
+    std::uint32_t rejected_shortlist_key_mismatch     = 0;
+    std::uint32_t rejected_private_not_catalogued     = 0;
+    std::uint32_t rejected_private_handle_missing     = 0;
+    std::uint32_t rejected_private_active_edge        = 0;
+    std::uint32_t rejected_shared_not_catalogued      = 0;
+    std::uint32_t rejected_shared_handle_missing      = 0;
+    std::uint32_t rejected_inspect_admission          = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationDiscoverySummary&,
+               const MaterializationDiscoverySummary&) noexcept = default;
+};
+
+// Best assessed pressure target of one admission candidate, in candidate-local terms.
+struct MaterializationTargetTrace {
+    std::uint32_t target_ordinal           = 0;
+    bool root_maximal                      = false;
+    std::uint32_t degradation_units        = 0;
+    std::uint32_t reused_prompt_tokens     = 0;
+    std::uint32_t remaining_prefill_tokens = 0;
+    std::uint32_t remaining_vision_prefill = 0;
+    std::uint32_t owner_evictions          = 0;
+    std::uint32_t checkpoint_drops         = 0;
+    std::uint64_t affected_selected_hits   = 0;
+    std::uint64_t transferred_bytes        = 0;
+    std::uint32_t copy_operations          = 0;
+    std::uint64_t predicted_now_ns         = 0;
+    std::uint64_t predicted_future_loss_ns = 0;
+    std::uint64_t predicted_total_ns       = 0;
+    std::uint64_t lower_bound_ns           = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationTargetTrace&,
+               const MaterializationTargetTrace&) noexcept = default;
+};
+
+// One admission candidate as seen by the materialization planner: its identity assessment plus
+// the aggregated outcome of pressure-target discovery and assessment for that candidate.
+struct MaterializationCandidateTrace {
+    std::uint32_t candidate_id                 = 0;
+    std::uint32_t identity_target_ordinal      = 0;
+    PrefixReusePath reuse_path                 = PrefixReusePath::Root;
+    bool current_session_binding               = false;
+    MaterializationProjectionStatus physical_status = MaterializationProjectionStatus::Infeasible;
+    MaterializationSourceMode source_mode      = MaterializationSourceMode::ConsumeToActive;
+    bool feasible                              = false;
+    bool expandable                            = false;
+    bool pressure_may_change_machine_work      = false;
+    bool logical_goal_available                = false;
+    bool candidate_seeded                      = false;
+    std::uint32_t reused_prompt_tokens         = 0;
+    std::uint32_t remaining_prefill_tokens     = 0;
+    std::uint32_t remaining_vision_prefill     = 0;
+    std::uint64_t predicted_now_ns             = 0;
+    std::uint64_t predicted_total_ns           = 0;
+    std::uint64_t lower_bound_ns               = 0;
+    std::uint64_t transferred_bytes            = 0;
+    std::uint32_t copy_operations              = 0;
+    std::uint32_t targets_discovered           = 0;
+    std::uint32_t targets_assessed             = 0;
+    std::uint32_t feasible_targets             = 0;
+    std::optional<MaterializationTargetTrace> best_assessed_target;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationCandidateTrace&,
+               const MaterializationCandidateTrace&) noexcept = default;
+};
+
+// Why one materialization stopped its bounded pressure search, parallel to the aggregate
+// `stop_reason` but carrying the search-window and exhaustion facts needed to interpret it.
+struct MaterializationBudgetDecision {
+    MaterializationStopReason reason           = MaterializationStopReason::NoPressure;
+    std::uint64_t search_granted_ns            = 0;
+    std::uint64_t search_elapsed_ns            = 0;
+    bool search_performed                      = false;
+    bool budget_exhausted                      = false;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationBudgetDecision&,
+               const MaterializationBudgetDecision&) noexcept = default;
+};
+
+// Identity of the initial and final planning incumbent. Removes the ambiguity of the aggregate
+// `initial_predicted_total_ns` / `predicted_total_ns` fields by naming the precise candidate and
+// pressure target that produced each cost.
+struct MaterializationIncumbentTrace {
+    std::uint32_t candidate_id             = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t target_ordinal           = std::numeric_limits<std::uint32_t>::max();
+    PrefixReusePath reuse_path             = PrefixReusePath::Root;
+    bool root_maximal                      = false;
+    std::uint32_t degradation_units        = 0;
+    std::uint32_t reused_prompt_tokens     = 0;
+    std::uint64_t predicted_now_ns         = 0;
+    std::uint64_t predicted_future_loss_ns = 0;
+    std::uint64_t predicted_total_ns       = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationIncumbentTrace&,
+               const MaterializationIncumbentTrace&) noexcept = default;
+};
+
 struct MaterializationDiagnostics {
     std::uint64_t predicted_now_ns           = 0;
     std::uint64_t predicted_future_loss_ns   = 0;
@@ -738,6 +864,16 @@ struct MaterializationDiagnostics {
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
     bool selected_maximal_fallback           = false;
+
+    // Structured trace describing how this decision was reached. Populated by the runtime
+    // materialization planner and resource manager so that one request log can distinguish
+    // candidate-discovery failure from a reusable candidate that reached planning but lost the
+    // selection, and can identify which admission candidate/target produced the aggregate costs.
+    MaterializationDiscoverySummary discovery;
+    MaterializationIncumbentTrace initial_incumbent;
+    MaterializationIncumbentTrace selected_incumbent;
+    MaterializationBudgetDecision budget_decision;
+    std::vector<MaterializationCandidateTrace> candidates;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

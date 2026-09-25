@@ -407,7 +407,82 @@ int main() {
                           .budget_exhausted           = false,
                           .selected_degradation_units = 2,
                           .selected_maximal_fallback  = false,
+                          .discovery = {
+                              .prefix_index_entries          = 12,
+                              .valid_prefix_index_entries    = 9,
+                              .shortlist_matches             = 4,
+                              .accepted_reuse_candidates     = 2,
+                              .best_reuse_prompt_tokens      = 109000,
+                              .rejected_private_active_edge  = 1,
+                          },
+                          .initial_incumbent = {
+                              .candidate_id        = 0,
+                              .target_ordinal      = 0,
+                              .reuse_path          = ninfer::PrefixReusePath::PrivateTurnClosure,
+                              .reused_prompt_tokens= 108800,
+                              .predicted_total_ns  = 250000,
+                          },
+                          .selected_incumbent = {
+                              .candidate_id        = 1,
+                              .target_ordinal      = 7,
+                              .reuse_path          = ninfer::PrefixReusePath::PrivateTurnClosure,
+                              .reused_prompt_tokens= 108900,
+                              .predicted_total_ns  = 240000,
+                          },
+                          .budget_decision = {
+                              .reason            = ninfer::MaterializationStopReason::QueueExhausted,
+                              .search_granted_ns = 5000000,
+                              .search_elapsed_ns = 6000,
+                              .search_performed  = true,
+                              .budget_exhausted  = false,
+                          },
     };
+    {
+        // Candidate traces are built field-by-field because assigning the optional
+        // best_assessed_target inside an aggregate designated initializer cannot deduce its type.
+        ninfer::MaterializationCandidateTrace trace_0;
+        trace_0.candidate_id            = 0;
+        trace_0.identity_target_ordinal = 0;
+        trace_0.reuse_path              = ninfer::PrefixReusePath::PrivateTurnClosure;
+        trace_0.current_session_binding = false;
+        trace_0.physical_status         = ninfer::MaterializationProjectionStatus::Feasible;
+        trace_0.source_mode             = ninfer::MaterializationSourceMode::ConsumeToActive;
+        trace_0.feasible                = true;
+        trace_0.candidate_seeded        = true;
+        trace_0.reused_prompt_tokens    = 108800;
+        trace_0.remaining_prefill_tokens = 200;
+        trace_0.predicted_now_ns        = 200000;
+        trace_0.predicted_total_ns      = 250000;
+        trace_0.lower_bound_ns          = 150000;
+        trace_0.targets_discovered      = 0;
+        trace_0.targets_assessed        = 0;
+        trace_0.feasible_targets        = 0;
+
+        ninfer::MaterializationCandidateTrace trace_1;
+        trace_1.candidate_id            = 1;
+        trace_1.identity_target_ordinal = 1;
+        trace_1.reuse_path              = ninfer::PrefixReusePath::PrivateTurnClosure;
+        trace_1.current_session_binding = true;
+        trace_1.physical_status         = ninfer::MaterializationProjectionStatus::Feasible;
+        trace_1.source_mode             = ninfer::MaterializationSourceMode::ConsumeToActive;
+        trace_1.feasible                = true;
+        trace_1.expandable              = true;
+        trace_1.candidate_seeded        = true;
+        trace_1.reused_prompt_tokens    = 108900;
+        trace_1.remaining_prefill_tokens = 100;
+        trace_1.predicted_total_ns      = 240000;
+        trace_1.targets_discovered      = 3;
+        trace_1.targets_assessed        = 2;
+        trace_1.feasible_targets        = 1;
+        trace_1.best_assessed_target    = ninfer::MaterializationTargetTrace{
+            .target_ordinal           = 7,
+            .reused_prompt_tokens     = 108900,
+            .remaining_prefill_tokens = 100,
+            .predicted_total_ns       = 240000,
+            .lower_bound_ns           = 140000,
+        };
+        outcome.metrics.materialization.candidates = {trace_0, trace_1};
+    }
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
@@ -459,6 +534,32 @@ int main() {
                           !done.at("materialization").contains("model_optimal") &&
                           !done.at("materialization").contains("absolute_bound_gap_ns"),
                       "request-owned materialization diagnostics missing");
+    failures += check(
+        done.at("materialization").at("discovery").at("prefix_index_entries") == 12 &&
+            done.at("materialization").at("discovery").at("best_reuse_prompt_tokens") == 109000 &&
+            done.at("materialization").at("discovery").at("rejected_private_active_edge") == 1 &&
+            done.at("materialization").at("initial_incumbent").at("candidate_id") == 0 &&
+            done.at("materialization").at("initial_incumbent").at("reuse_path") ==
+                "private_turn_closure" &&
+            done.at("materialization").at("selected_incumbent").at("candidate_id") == 1 &&
+            done.at("materialization").at("selected_incumbent").at("target_ordinal") == 7 &&
+            done.at("materialization").at("selected_incumbent").at("predicted_total_ns") ==
+                240000 &&
+            done.at("materialization").at("budget_decision").at("reason") == "queue_exhausted" &&
+            done.at("materialization").at("budget_decision").at("search_performed") == true &&
+            done.at("materialization").at("budget_decision").at("search_granted_ns") == 5000000 &&
+            done.at("materialization").at("candidates").size() == 2 &&
+            done.at("materialization").at("candidates").at(0).at("physical_status") == "feasible" &&
+            done.at("materialization").at("candidates").at(0).at("source_mode") ==
+                "consume_to_active" &&
+            done.at("materialization").at("candidates").at(0).at("candidate_seeded") == true &&
+            done.at("materialization").at("candidates").at(1).at("targets_discovered") == 3 &&
+            done.at("materialization")
+                    .at("candidates")
+                    .at(1)
+                    .at("best_assessed_target")
+                    .at("target_ordinal") == 7,
+        "materialization structured trace fields missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -

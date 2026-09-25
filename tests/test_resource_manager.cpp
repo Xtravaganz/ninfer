@@ -2283,6 +2283,17 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
+    require(result && result->diagnostics.selected_incumbent.candidate_id == 0 &&
+                result->diagnostics.selected_incumbent.reuse_path ==
+                    ninfer::PrefixReusePath::Root &&
+                result->diagnostics.budget_decision.search_performed &&
+                result->diagnostics.budget_decision.reason !=
+                    ninfer::MaterializationStopReason::NoPressure &&
+                result->diagnostics.candidates.size() == 1 &&
+                result->diagnostics.candidates[0].candidate_seeded &&
+                result->diagnostics.candidates[0].pressure_may_change_machine_work &&
+                result->diagnostics.candidates[0].targets_discovered >= 1,
+            "pressure search did not record an expandable candidate trace");
 }
 
 void test_dominating_identity_does_not_build_pressure_graph() {
@@ -2319,6 +2330,18 @@ void test_dominating_identity_does_not_build_pressure_graph() {
                 result->diagnostics.stop_reason == ninfer::MaterializationStopReason::NoPressure &&
                 !pressure_inputs_built && program.pressure_planning_sessions == 0,
             "dominating identity eagerly constructed the pressure graph");
+    require(result && result->diagnostics.initial_incumbent.candidate_id == 0 &&
+                result->diagnostics.selected_incumbent.candidate_id == 0 &&
+                result->diagnostics.selected_incumbent.reuse_path ==
+                    ninfer::PrefixReusePath::Root &&
+                result->diagnostics.budget_decision.reason ==
+                    ninfer::MaterializationStopReason::NoPressure &&
+                !result->diagnostics.budget_decision.search_performed &&
+                result->diagnostics.candidates.size() == 1 &&
+                result->diagnostics.candidates[0].candidate_id == 0 &&
+                result->diagnostics.candidates[0].reuse_path == ninfer::PrefixReusePath::Root &&
+                result->diagnostics.candidates[0].candidate_seeded,
+            "no-pressure identity decision lost its incumbent/candidate trace");
 }
 
 FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
@@ -2346,6 +2369,24 @@ void test_root_lifecycle_and_prefix_reuse() {
             "catalogued endpoint was not reusable");
     require(reuse.choice->summary().reusable_prompt_tokens == 16,
             "endpoint reuse frontier was not selected");
+    require(reuse.choice->diagnostics().selected_incumbent.candidate_id == 1 &&
+                reuse.choice->diagnostics().selected_incumbent.reuse_path ==
+                    ninfer::PrefixReusePath::PrivateEndpoint &&
+                reuse.choice->diagnostics().selected_incumbent.reused_prompt_tokens == 16 &&
+                reuse.choice->diagnostics().budget_decision.reason ==
+                    ninfer::MaterializationStopReason::NoPressure &&
+                !reuse.choice->diagnostics().budget_decision.search_performed &&
+                reuse.choice->diagnostics().candidates.size() == 2 &&
+                reuse.choice->diagnostics().candidates[1].reuse_path ==
+                    ninfer::PrefixReusePath::PrivateEndpoint &&
+                reuse.choice->diagnostics().candidates[0].reuse_path ==
+                    ninfer::PrefixReusePath::Root &&
+                reuse.choice->diagnostics().discovery.prefix_index_entries == 1 &&
+                reuse.choice->diagnostics().discovery.valid_prefix_index_entries == 1 &&
+                reuse.choice->diagnostics().discovery.shortlist_matches == 1 &&
+                reuse.choice->diagnostics().discovery.accepted_reuse_candidates == 1 &&
+                reuse.choice->diagnostics().discovery.best_reuse_prompt_tokens == 16,
+            "reused choice did not carry the private-endpoint discovery trace");
     program.abort_start = true;
     const auto status   = manager.reserve_materialization(program, std::move(*reuse.choice),
                                                           FakePreparedPrompt{7}, {});
