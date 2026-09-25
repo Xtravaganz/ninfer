@@ -22,7 +22,7 @@ namespace ninfer::serve {
 
 // Schema version 21 adds the request-owned materialization planning traces: discovery rejection
 // counters and best reusable prefix, per-candidate identity/pressure traces with assessment
-// counts, initial/selected incumbent identity, and the bounded-search budget decision.
+// counts, initial/selected incumbent identity, and the bounded-search stop facts.
 inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
