@@ -20,7 +20,10 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 20;
+// Schema version 21 adds the request-owned materialization planning traces: discovery rejection
+// counters and best reusable prefix, per-candidate identity/pressure traces with assessment
+// counts, initial/selected incumbent identity, and the bounded-search budget decision.
+inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

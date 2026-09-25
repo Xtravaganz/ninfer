@@ -327,6 +327,7 @@ public:
             [](const PrefixIndexEntry& entry) { return entry.occupied; }));
         if (cache_enabled_) {
             for (const PrefixIndexEntry& index : prefix_index_) {
+                if (!index.occupied) { continue; }
                 if (!valid_prefix_index_entry(index)) {
                     ++discovery.rejected_invalid_prefix_index_entry;
                     continue;

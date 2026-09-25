@@ -2344,6 +2344,110 @@ void test_dominating_identity_does_not_build_pressure_graph() {
             "no-pressure identity decision lost its incumbent/candidate trace");
 }
 
+// ISSUE.md warm->root collapse: a large reusable candidate (109169-token private endpoint prefix)
+// reaches the planner, its identity requires pressure (infeasible but expandable), and the bounded
+// search cannot explore it, so root stays selected. The trace must show the candidate reached
+// planning (present in `candidates` with full identity data) at the same time as targets_assessed
+// == 0, separating "never discovered" from "reached the planner but was never assessed".
+void test_cannot_explore_large_reuse_search_stops_leaves_root() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+
+    // Identity costs are hand-built per candidate; the pressure search grant is derived from the
+    // incumbent root cost (min(5ms, total/20)). A zero-prefill cost model collapses the grant to
+    // 0 ns so the search deterministically stops on the first budget check (elapsed >= 0) before
+    // the reusable candidate's pressure targets can be discovered or assessed.
+    ninfer::runtime::ContextMachineCostModel zero_cost = test_cost_model();
+    zero_cost.prefill.token_ns_q32          = 0;
+    zero_cost.prefill.attention_pair_ns_q32 = 0;
+
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 0, 0);
+    root.value.prompt_tokens                          = 111'258;
+    root.value.prefix_reuse_path                      = ninfer::PrefixReusePath::Root;
+    root.identity.machine_work.remaining_prefill_work.tokens = 111'258;
+    root.identity.machine_work.reused_prompt_tokens   = 0;
+    root.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    root.identity.source_mode                         = PrivateSourceMode::ConsumeToActive;
+    root.identity.pressure_may_change_machine_work    = false;
+    root.identity.assessment_digest                   = 11;
+
+    FakeAdmissionCandidate reuse;
+    set_fake_machine_costs(reuse.identity.machine_work, 0, 0);
+    reuse.value.prompt_tokens                           = 111'258;
+    reuse.value.reusable_prompt_tokens                  = 109'169;
+    reuse.value.prefix_reuse_path                       = ninfer::PrefixReusePath::PrivateEndpoint;
+    reuse.identity.machine_work.remaining_prefill_work.tokens = 2'089;
+    reuse.identity.machine_work.reused_prompt_tokens    = 109'169;
+    reuse.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    reuse.identity.source_mode                          = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable                           = true;
+    reuse.identity.pressure_may_change_machine_work     = true;
+    reuse.identity.assessment_digest                    = 12;
+
+    const std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs { return {}; };
+    const auto logical_goal    = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result = planner.plan(program, FakePreparedPrompt{}, zero_cost, candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->plan && result->candidate == PlanningCandidateId{.value = 0},
+            "root was not sealed when the search could not explore the reusable candidate");
+    require(result &&
+                result->diagnostics.stop_reason == ninfer::MaterializationStopReason::TimeBudget &&
+                result->diagnostics.budget_exhausted,
+            "search did not stop on the exhausted search grant");
+    require(result && result->diagnostics.budget_decision.search_performed &&
+                result->diagnostics.budget_decision.reason ==
+                    ninfer::MaterializationStopReason::TimeBudget &&
+                result->diagnostics.budget_decision.budget_exhausted &&
+                result->diagnostics.budget_decision.search_granted_ns == 0,
+            "budget decision did not record the collapsed search grant and time-budget stop");
+    require(result && result->diagnostics.initial_incumbent.candidate_id == 0 &&
+                result->diagnostics.selected_incumbent.candidate_id == 0 &&
+                result->diagnostics.selected_incumbent.reuse_path == ninfer::PrefixReusePath::Root &&
+                result->diagnostics.selected_incumbent.reused_prompt_tokens == 0 &&
+                !result->diagnostics.selected_incumbent.root_maximal,
+            "incumbent traces did not name the identity-feasible root as initial and selected");
+
+    require(result && result->diagnostics.candidates.size() == 2 &&
+                result->diagnostics.candidates[0].reuse_path == ninfer::PrefixReusePath::Root &&
+                result->diagnostics.candidates[0].feasible &&
+                result->diagnostics.candidates[0].candidate_seeded &&
+                result->diagnostics.candidates[0].remaining_prefill_tokens == 111'258,
+            "root candidate trace did not reach the planner as an identity-feasible incumbent");
+    require(result && result->diagnostics.candidates[1].reuse_path ==
+                          ninfer::PrefixReusePath::PrivateEndpoint &&
+                result->diagnostics.candidates[1].physical_status ==
+                    ninfer::MaterializationProjectionStatus::Infeasible &&
+                result->diagnostics.candidates[1].expandable &&
+                result->diagnostics.candidates[1].pressure_may_change_machine_work &&
+                !result->diagnostics.candidates[1].logical_goal_available &&
+                !result->diagnostics.candidates[1].candidate_seeded &&
+                result->diagnostics.candidates[1].reused_prompt_tokens == 109'169 &&
+                result->diagnostics.candidates[1].remaining_prefill_tokens == 2'089 &&
+                result->diagnostics.candidates[1].targets_discovered == 0 &&
+                result->diagnostics.candidates[1].targets_assessed == 0,
+            "large reusable candidate reached the planner (identity needs pressure) but its "
+            "pressure targets were never assessed before the search stopped");
+}
+
 FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
                                std::uint32_t frontier = 16) {
     program.finish_frontier = frontier;
@@ -2383,6 +2487,7 @@ void test_root_lifecycle_and_prefix_reuse() {
                     ninfer::PrefixReusePath::Root &&
                 reuse.choice->diagnostics().discovery.prefix_index_entries == 1 &&
                 reuse.choice->diagnostics().discovery.valid_prefix_index_entries == 1 &&
+                reuse.choice->diagnostics().discovery.rejected_invalid_prefix_index_entry == 0 &&
                 reuse.choice->diagnostics().discovery.shortlist_matches == 1 &&
                 reuse.choice->diagnostics().discovery.accepted_reuse_candidates == 1 &&
                 reuse.choice->diagnostics().discovery.best_reuse_prompt_tokens == 16,
@@ -3304,6 +3409,8 @@ int main() {
              test_candidate_search_prefers_deep_reuse_without_eviction);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
+    run_test("large reuse cannot explore before time budget",
+             test_cannot_explore_large_reuse_search_stops_leaves_root);
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);

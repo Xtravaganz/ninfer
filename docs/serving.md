@@ -875,6 +875,29 @@ Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_c
 `value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
 Aborted planning attempts are not published.
 
+The `discovery` object counts prefix-index candidates before planning: `prefix_index_entries`,
+`valid_prefix_index_entries`, `shortlist_matches`, `accepted_reuse_candidates`, and
+`best_reuse_prompt_tokens` (the largest reusable prefix among accepted candidates), plus one
+`rejected_*` counter per discovery filter (`invalid_prefix_index_entry`, `shortlist_key_mismatch`,
+`private_not_catalogued`, `private_handle_missing`, `private_active_edge`, `shared_not_catalogued`,
+`shared_handle_missing`, `inspect_admission`). The counters cover only occupied prefix-index entries,
+so `valid_prefix_index_entries` plus `rejected_invalid_prefix_index_entry` equals
+`prefix_index_entries`, and `shortlist_matches` equals the accepted plus all rejection counts.
+`best_reuse_prompt_tokens = 0` with nonzero `accepted_reuse_candidates` can therefore separate a
+discovery failure from a reuse candidate that reached planning and selection and was lost there.
+
+The `candidates` array carries one identity-level trace per admission candidate: `reuse_path`,
+`physical_status`, `feasible`, `expandable`, `pressure_may_change_machine_work`,
+`logical_goal_available`, `candidate_seeded`, and the candidate's own `targets_discovered`,
+`targets_assessed`, and `feasible_targets` pressure-search counts, with `best_assessed_target` (the
+planner-preferred assessed pressure target) when any was assessed. `initial_incumbent` and
+`selected_incumbent` name the candidate, `target_ordinal`, `reuse_path`, `root_maximal`,
+`degradation_units`, `reused_prompt_tokens`, and predicted cost of the search-start and final
+incumbents. `budget_decision` records `reason`, the `search_granted_ns`/`search_elapsed_ns`
+budget comparison, `search_performed`, and `budget_exhausted`, distinguishing a search that never
+started from one that exhausted its grant. `target_ordinal` is the candidate-opaque stable ordinal
+inside one planning session; it is only meaningful relative to the other traces of the same event.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
