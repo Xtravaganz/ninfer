@@ -3043,6 +3043,145 @@ void test_shared_capture_combines_two_pressure_owners() {
     (void)finish_active(manager, program, active);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Rolling retention. Live shape: one conversation grows monotonically; each request reuses the
+// newest shared frontier and offers a capture at its own end. Once the State pools saturate that
+// capture must evict an OLDER ancestor whose accumulated demand outweighs the newcomer's single
+// demand bit, so the frontier pins. Rolling mode lets a capture inherit the demand of every
+// ancestor the current request has PROVEN it extends (exact key match at that frontier).
+// ---------------------------------------------------------------------------------------------
+namespace rolling {
+
+constexpr std::uint32_t kLineage = 500;
+
+struct Fixture {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+    std::uint64_t order = 0;
+
+    ActiveRequest publish_shared(std::uint32_t frontier) {
+        FakeRequestBasePlan base = make_base(kLineage);
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = frontier,
+        });
+        const ActiveRequest active = start_active(manager, program, kLineage, base, ++order);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = kLineage, .frontier = frontier},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = frontier},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        require(manager.reserve_active_capture(program, active.lane,
+                                               FakeCaptureOffer{.id = 900 + frontier}, 0, {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "rolling fixture could not publish a shared ancestor");
+        auto progress = manager.progress_context_transaction(program, {});
+        require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                    ContextTransactionStatus::Published,
+                "rolling fixture ancestor did not publish");
+        return active;
+    }
+
+    // Two ancestors; the lineage is reused by intervening requests so the ancestors accrue demand.
+    void seed_lineage() {
+        (void)finish_active(manager, program, publish_shared(64));
+        for (int i = 0; i < 2; ++i) {
+            (void)finish_active(manager, program,
+                                start_active(manager, program, kLineage, make_base(kLineage),
+                                             ++order));
+        }
+        (void)finish_active(manager, program, publish_shared(96));
+    }
+
+    ActiveRequest start(std::uint32_t digest) {
+        return start_active(manager, program, digest, make_base(digest), ++order);
+    }
+};
+
+} // namespace rolling
+
+// A. Default policy: a continuation inherits nothing, so the capture is valued on its own single
+// demand bit exactly as before -- the condition under which the live frontier pinned.
+void test_rolling_default_inherits_no_ancestor_demand() {
+    rolling::Fixture f;
+    f.seed_lineage();
+    const ActiveRequest active = f.start(rolling::kLineage);
+    require(f.manager.rolling_inherited_demand(active.lane) == 0,
+            "default policy attributed ancestor demand to a capture");
+    (void)f.manager.abort(f.program, active.lane, active.sequence);
+}
+
+// B. Rolling: a request that key-matched its ancestors makes their demand the capture's demand.
+void test_rolling_continuation_inherits_ancestor_demand() {
+    rolling::Fixture f;
+    f.manager.enable_rolling_retention();
+    f.seed_lineage();
+    const ActiveRequest active    = f.start(rolling::kLineage);
+    const std::uint32_t inherited = f.manager.rolling_inherited_demand(active.lane);
+    require(inherited != 0, "rolling retention inherited no demand from proven ancestors");
+    // Several requests demanded the lineage; the newcomer must carry more than its own bit.
+    require(__builtin_popcount(inherited) >= 2,
+            "rolling retention inherited less than the ancestors' demonstrated demand");
+    (void)f.manager.abort(f.program, active.lane, active.sequence);
+}
+
+// C. Rolling: an unrelated lineage matched nothing, inherits nothing, and is judged as default.
+void test_rolling_unrelated_lineage_inherits_nothing() {
+    rolling::Fixture f;
+    f.manager.enable_rolling_retention();
+    f.seed_lineage();
+    const ActiveRequest active = f.start(/*digest=*/999);
+    require(f.manager.rolling_inherited_demand(active.lane) == 0,
+            "rolling retention granted a non-prefix candidate another lineage's demand");
+    (void)f.manager.abort(f.program, active.lane, active.sequence);
+}
+
+// The value fold on the live-shaped numbers: an older ancestor with three demand bits, a newer
+// frontier with a larger rebuild. Alone the newcomer cannot justify evicting the ancestor; with
+// the ancestor's demand inherited it can. Nothing in the fold itself changes between the two.
+void test_rolling_inherited_demand_flips_the_portfolio_verdict() {
+    using ninfer::runtime::ContextPortfolioCheckpointValue;
+    using ninfer::runtime::ContextPortfolioOwnerPolicy;
+    using ninfer::runtime::ContextPortfolioValue;
+
+    const std::array owners{
+        ContextPortfolioOwnerPolicy{.owner = PlanningOwnerId{.value = 0}},
+        ContextPortfolioOwnerPolicy{.owner = PlanningOwnerId{.value = 1}},
+    };
+
+    const auto fold = [&](std::uint32_t newcomer_demand) {
+        const std::array checkpoints{
+            ContextPortfolioCheckpointValue{
+                .owner                = PlanningOwnerId{.value = 0},
+                .demand_mask          = 0b0111,
+                .rebuild_ns           = 5'000,
+                .baseline_recovery_ns = 0,
+                .target_recovery_ns   = 5'000,
+            },
+            ContextPortfolioCheckpointValue{
+                .owner                = PlanningOwnerId{.value = 1},
+                .demand_mask          = newcomer_demand,
+                .rebuild_ns           = 7'000,
+                .baseline_recovery_ns = 7'000,
+                .target_recovery_ns   = 0,
+            },
+        };
+        ContextPortfolioValue value;
+        return value.fold(owners, checkpoints);
+    };
+
+    const auto alone = fold(0b1000);
+    require(alone.target_public_value < alone.baseline_public_value,
+            "a lone newcomer out-valued the demanded ancestor it would evict");
+
+    const auto inherited = fold(0b1000 | 0b0111);
+    require(inherited.target_public_value > inherited.baseline_public_value,
+            "an inheriting newcomer did not out-value the ancestor it supersedes");
+}
+
 void test_aborted_shared_capture_start_rolls_back_logical_claims() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3513,6 +3652,14 @@ int main() {
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("rolling: default inherits no ancestor demand",
+             test_rolling_default_inherits_no_ancestor_demand);
+    run_test("rolling: continuation inherits ancestor demand",
+             test_rolling_continuation_inherits_ancestor_demand);
+    run_test("rolling: unrelated lineage inherits nothing",
+             test_rolling_unrelated_lineage_inherits_nothing);
+    run_test("rolling: inherited demand flips the portfolio verdict",
+             test_rolling_inherited_demand_flips_the_portfolio_verdict);
     run_test("aborted shared capture logical rollback",
              test_aborted_shared_capture_start_rolls_back_logical_claims);
     run_test("validate complete capture result before adoption",
