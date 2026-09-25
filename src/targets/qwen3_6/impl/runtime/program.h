@@ -559,7 +559,8 @@ public:
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  bool decode_runnable);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -992,7 +993,8 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                        bool decode_runnable);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
                runtime::ExecutionTiming* failed_timing);
@@ -1207,7 +1209,7 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::ExecutionTiming* failed_timing, bool decode_runnable);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

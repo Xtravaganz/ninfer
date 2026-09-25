@@ -685,6 +685,9 @@ template <class Variant>
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    // Number of prefill execution units (chunks) completed in this step; drives service-work
+    // accounting and the prefill_units host-timing stat.
+    std::uint32_t processed_chunks = 0;
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
@@ -875,7 +878,8 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
-                    runtime::ExecutionTiming* failed_timing = nullptr);
+                    runtime::ExecutionTiming* failed_timing = nullptr,
+                    bool decode_runnable = false);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer<Variant>& offer,
                     const SharedPrefixHandle<Variant>* exact_shared,

@@ -405,8 +405,9 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
-                                  runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+                                  runtime::ExecutionTiming* failed_timing,
+                                  bool decode_runnable) {
+    return impl_->advance_prefill(sequence, failed_timing, decode_runnable);
 }
 
 template <>

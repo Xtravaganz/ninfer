@@ -44,6 +44,11 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
+// cudaMemcpyAsync from pageable host memory may block on first use per context (the driver stages
+// the copy through a pinned buffer), but that blocking is not a stable synchronization contract.
+// Callers must keep the host source alive until the next stream barrier (advance_prefill places
+// one at every real return point) and must not rely on the copy having completed when this
+// function returns.
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
@@ -1308,9 +1313,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
+    // No per-chunk hard sync. All prefill kernels, D2H/H2D/D2D copies, and the decode CUDA graphs
+    // run on the single compute stream (ctx_.stream == device.stream), which serializes them in
+    // order: chunk N+1's kernels start only after chunk N's kernels complete, so resetting and
+    // reusing the workspace arena across chunks is safe. Host bookkeeping between chunks (KV
+    // commit, state fork settlement) reads no device state. The caller performs one
+    // device.synchronize() at the end of the round before any D2H read (sampled token, MTP drafts).
+    // This is a hard architectural invariant: introducing a second CUDA stream into prefill,
+    // state-copy, KV-publishing, or DFlash invalidates the arena-reuse and deferred-sync
+    // assumptions and requires restoring a per-chunk barrier.
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,

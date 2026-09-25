@@ -37,6 +37,17 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 
 using Clock = std::chrono::steady_clock;
 
+// Maximum number of prefill chunks processed per advance_prefill execution unit when no decode
+// lane is runnable. Chunks are serialized on the single compute stream, so the workspace arena
+// is reset and reused across chunks within one step. advance_prefill places a stream barrier at
+// every real return point after chunks are enqueued, so at most kMaxPrefillChunksPerStep chunks
+// are outstanding between barriers. When decode lanes are runnable the scheduler passes
+// decode_runnable=true and the step is capped at one chunk so decode inter-token latency stays
+// fair. This is a hard architectural invariant: a second CUDA stream in prefill, state-copy,
+// KV-publishing, or DFlash invalidates the arena-reuse and deferred-sync assumptions and requires
+// restoring a per-chunk barrier.
+constexpr std::uint32_t kMaxPrefillChunksPerStep = 4;
+
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
@@ -7085,6 +7096,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
     PrefillProgress out;
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
+    out.processed_chunks        = step.processed_chunks;
     out.complete                = step.complete;
     out.timing                  = step.timing;
     if (step.complete) {
@@ -7335,7 +7347,8 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
-                                                 runtime::ExecutionTiming* failed_timing) {
+                                                 runtime::ExecutionTiming* failed_timing,
+                                                 bool decode_runnable) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
@@ -7344,7 +7357,8 @@ PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
         throw std::logic_error("prefill advance requires a prefilling sequence");
     }
     try {
-        runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing);
+        runtime::PrefillStepResult step =
+            advance_prefill_raw(lane, failed_timing, decode_runnable);
         if (failed_timing != nullptr) { *failed_timing += step.timing; }
         return wrap_prefill(lane, std::move(step));
     } catch (...) {
@@ -9984,9 +9998,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
 }
 
 runtime::PrefillStepResult
-ProgramImplCore::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+ProgramImplCore::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                                     bool decode_runnable) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, decode_runnable);
 }
 
 runtime::ExecutionTiming
@@ -11421,13 +11436,28 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 
 runtime::PrefillStepResult
 ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
-                                 runtime::ExecutionTiming* failed_timing) {
+                                 runtime::ExecutionTiming* failed_timing, bool decode_runnable) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    // Barrier at every real return point after chunks are enqueued. device.synchronize() is
+    // stream-local (cudaStreamSynchronize), so this waits only for this stream's outstanding
+    // prefill work; without it, a later decode's device wait would absorb this prefill's GPU time
+    // into decode telemetry. The zero-prefill capture offer return enqueues no GPU work and skips
+    // the barrier.
+    const auto barrier = [&]() {
+        timing.begin_wait();
+        device.synchronize();
+        timing.end_wait();
+    };
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
 
     RequestControl::Prefill& staged = *request.prefill;
+    // Vision payloads back the H2D copies enqueued by the chunk; they must stay alive until the
+    // stream barrier that follows, so release them only after barrier().
+    const auto release_vision_payloads = [&]() {
+        if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
+    };
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
@@ -11435,6 +11465,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t processed_chunks        = 0;
     const auto started                    = Clock::now();
     try {
         if (staged.next_capture < staged.capture_groups.size() &&
@@ -11448,8 +11479,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;
             return runtime::PrefillStepResult{
-                .summary = summary,
-                .timing  = timing.finish(),
+                .summary          = summary,
+                .processed_chunks = 1,
+                .timing           = timing.finish(),
             };
         }
         StateImageSelectors selectors = state_selectors(sequence);
@@ -11506,8 +11538,18 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         }
 
         if (staged.cursor < staged.prompt_tokens) {
+            // Text prefill advances up to kMaxPrefillChunksPerStep chunks per execution unit; the
+            // workspace arena is reset and reused across chunks on the single compute stream. When
+            // decode lanes are runnable the scheduler caps the step at one chunk so decode
+            // inter-token latency stays fair. Vision prefill stays at one chunk per unit because
+            // its chunk boundaries are set by the vision use spans, and projected_service_work
+            // accounts those spans as separate units.
+            const std::uint32_t max_chunks = decode_runnable ? 1 : kMaxPrefillChunksPerStep;
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                staged.vision
+                    ? std::min(prefill_chunk, staged.prompt_tokens - staged.cursor)
+                    : std::min(max_chunks * prefill_chunk,
+                               staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -11563,7 +11605,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }
-                if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
+                ++processed_chunks;
                 staged.cursor += result.processed_tokens;
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
@@ -11588,9 +11630,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
                         staged.pending_capture_offer = next_capture_offer_id_;
+                        barrier();
+                        release_vision_payloads();
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
+                            .processed_chunks        = processed_chunks,
                             .timing                  = timing.finish(),
                         };
                     }
@@ -11606,9 +11651,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                barrier();
+                release_vision_payloads();
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .processed_chunks        = processed_chunks,
                     .timing                  = timing.finish(),
                 };
             }
@@ -11619,6 +11667,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else {
+            // Zero-suffix reuse samples the first token from the cached tail hidden; it executes
+            // no prefill chunk but is one service unit in projected_service_work (suffix == 0).
+            processed_chunks = 1;
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
@@ -11652,9 +11703,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        barrier();
+        release_vision_payloads();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
@@ -11699,6 +11749,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             .summary = summary,
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
+            .processed_chunks        = processed_chunks,
             .complete                = true,
             .timing                  = timing.finish(),
         };
