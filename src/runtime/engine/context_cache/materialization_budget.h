@@ -58,27 +58,51 @@ public:
                              bool complete_prediction, std::uint64_t progress,
                              bool discovery_eligible = true) noexcept {
         boundary_limited_             = false;
+        refusal_                      = MaterializationBudgetRefusal::None;
         const std::uint64_t elapsed   = now > started_ ? now - started_ : 0;
         const std::uint64_t remaining = allowance_.remaining(now);
         next_operation_ns             = std::max<std::uint64_t>(1, next_operation_ns);
         completion_ns                 = std::max(next_operation_ns, completion_ns);
+        decision_                     = MaterializationBudgetDecisionTrace{
+            .elapsed_ns              = elapsed,
+            .granted_ns              = granted_,
+            .remaining_allowance_ns  = remaining,
+            .next_operation_ns       = next_operation_ns,
+            .completion_ns           = completion_ns,
+            .gain_ns                 = gain_ns,
+            .economic_gain_budget_ns = economic(gain_ns),
+            .complete_prediction     = complete_prediction,
+            .discovery_eligible      = discovery_eligible,
+            .discovery_used          = discovery_used_,
+            .progress                = progress,
+            .renewal_progress        = renewal_progress_,
+        };
         if (next_operation_ns > remaining) {
             boundary_limited_ = true;
             reason_           = MaterializationStopReason::TimeBudget;
             return false;
         }
         if (elapsed < granted_ && next_operation_ns <= granted_ - elapsed) { return true; }
-        if (completion_ns > remaining || completion_ns > economic(gain_ns)) {
-            reason_ = MaterializationStopReason::InsufficientExpectedGain;
+        if (completion_ns > remaining) {
+            refusal_ = MaterializationBudgetRefusal::CompletionExceedsRemaining;
+            reason_  = MaterializationStopReason::InsufficientExpectedGain;
+            return false;
+        }
+        if (completion_ns > economic(gain_ns)) {
+            refusal_ = MaterializationBudgetRefusal::CompletionExceedsEconomicGain;
+            reason_  = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
         // Unknown forecasts get one bounded discovery episode, not a fresh grant for every node.
         if (!complete_prediction && (!discovery_eligible || discovery_used_)) {
-            reason_ = MaterializationStopReason::InsufficientExpectedGain;
+            refusal_ = !discovery_eligible ? MaterializationBudgetRefusal::DiscoveryNotEligible
+                                           : MaterializationBudgetRefusal::DiscoveryAlreadyUsed;
+            reason_  = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
         if (renewals_ != 0 && progress <= renewal_progress_) {
-            reason_ = MaterializationStopReason::InsufficientExpectedGain;
+            refusal_ = MaterializationBudgetRefusal::NoProgressSinceRenewal;
+            reason_  = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
         const auto hard = elapsed + remaining; // bounded by the allowance's representable duration
@@ -104,6 +128,14 @@ public:
 
     [[nodiscard]] bool discovery_used() const noexcept { return discovery_used_; }
 
+    [[nodiscard]] MaterializationBudgetRefusal refusal_reason() const noexcept {
+        return refusal_;
+    }
+
+    [[nodiscard]] const MaterializationBudgetDecisionTrace& decision_trace() const noexcept {
+        return decision_;
+    }
+
     [[nodiscard]] MaterializationStopReason stop_reason() const noexcept { return reason_; }
 
     [[nodiscard]] std::uint64_t overshoot(std::uint64_t now) const noexcept {
@@ -124,7 +156,9 @@ private:
     std::uint64_t renewal_progress_   = 0;
     std::uint32_t renewals_           = 0;
     bool discovery_used_              = false;
-    MaterializationStopReason reason_ = MaterializationStopReason::TimeBudget;
+    MaterializationBudgetRefusal refusal_ = MaterializationBudgetRefusal::None;
+    MaterializationStopReason reason_     = MaterializationStopReason::TimeBudget;
+    MaterializationBudgetDecisionTrace decision_;
 };
 
 } // namespace ninfer::runtime

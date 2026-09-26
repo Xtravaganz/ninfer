@@ -159,6 +159,10 @@ public:
             return plan_->resource_revision();
         }
 
+        [[nodiscard]] const MaterializationDiagnostics& diagnostics() const noexcept {
+            return diagnostics_;
+        }
+
     private:
         Choice(LaneId destination, ResourcePlan&& plan, std::uint32_t catalog_capacity,
                std::optional<CacheSessionKey> session, RetentionClass retention,
@@ -319,17 +323,37 @@ public:
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
+        MaterializationDiscoverySummary discovery;
+        discovery.prefix_index_entries = static_cast<std::uint32_t>(std::count_if(
+            prefix_index_.begin(), prefix_index_.end(),
+            [](const PrefixIndexEntry& entry) { return entry.occupied; }));
         if (cache_enabled_) {
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!index.occupied) { continue; }
+                if (!valid_prefix_index_entry(index)) {
+                    ++discovery.rejected_invalid_prefix_index_entry;
+                    continue;
+                }
+                ++discovery.valid_prefix_index_entries;
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming || *incoming != index.key) {
+                    ++discovery.rejected_shortlist_key_mismatch;
+                    continue;
+                }
+                ++discovery.shortlist_matches;
 
+                const auto record_accepted = [&](const AdmissionCandidate& plan) {
+                    ++discovery.accepted_reuse_candidates;
+                    discovery.best_reuse_prompt_tokens = std::max(
+                        discovery.best_reuse_prompt_tokens, plan.summary().reusable_prompt_tokens);
+                };
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
-                    if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                        private_has_active_edge(index.slot)) {
+                    // valid_prefix_index_entry() already required Catalogued + handle for this
+                    // entry, so not_catalogued / handle_missing are never rejected here.
+                    if (private_has_active_edge(index.slot)) {
+                        ++discovery.rejected_private_active_edge;
                         continue;
                     }
                     const bool retain =
@@ -339,12 +363,16 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
-                    if (!plan) { continue; }
+                    if (!plan) {
+                        ++discovery.rejected_inspect_admission;
+                        continue;
+                    }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
                         throw std::logic_error("Program returned an invalid private candidate");
                     }
+                    record_accepted(*plan);
                     const bool current_session_binding =
                         current_session_cell &&
                         session_index_[*current_session_cell].slot == index.slot &&
@@ -369,14 +397,19 @@ public:
                 }
 
                 const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                // valid_prefix_index_entry() already required Catalogued + handle for this entry,
+                // so not_catalogued / handle_missing are never rejected here.
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
-                if (!plan) { continue; }
+                if (!plan) {
+                    ++discovery.rejected_inspect_admission;
+                    continue;
+                }
                 if (plan->summary().reusable_prompt_tokens == 0 ||
                     plan->identity_assessment().source_mode != PrivateSourceMode::Retain) {
                     throw std::logic_error("Program returned an invalid shared candidate");
                 }
+                record_accepted(*plan);
                 append_unique(provisional_demand.exact_resident_keys, index.key);
                 candidates.push_back(Candidate{
                     .plan          = std::move(*plan),
@@ -396,7 +429,7 @@ public:
 
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
-                                 planning_started, provisional_demand, allowance);
+                                 planning_started, provisional_demand, discovery, allowance);
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
@@ -1832,7 +1865,9 @@ private:
                          const RequestBasePlan& base, LaneId destination,
                          std::vector<Candidate>& candidates, std::uint64_t publication_order,
                          typename Planner::Clock::time_point planning_started,
-                         PrefixDemandRecord& provisional_demand, PlanningAllowance allowance) {
+                         PrefixDemandRecord& provisional_demand,
+                         const MaterializationDiscoverySummary& discovery,
+                         PlanningAllowance allowance) {
         std::vector<typename Planner::CandidateInput> candidate_inputs;
         std::vector<const ContinuationHandle*> private_owners;
         std::vector<PlanningOwnerId> private_owner_ids;
@@ -2114,6 +2149,7 @@ private:
         choice.publication_slot_               = planned->publication_slot;
         choice.selected_observation_           = candidate.selected_observation;
         choice.diagnostics_                    = planned->diagnostics;
+        choice.diagnostics_.discovery          = discovery;
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {

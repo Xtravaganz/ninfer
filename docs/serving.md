@@ -866,6 +866,77 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
 `trailing_content`. These counters contain no tool arguments or generated text.
 
+`request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
+future-loss and total nanoseconds; evaluated targets and projection work; planning and search nanoseconds; stop reason;
+the budget-exhausted flag; selected degradation units; and whether the selected target was the maximal root fallback.
+Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`,
+`insufficient_expected_gain`, and `work_budget`. Search is bounded and heuristic; these diagnostics do not claim model
+or global optimality. Aborted planning attempts are not published.
+
+The bounded-search fields describe the search run: `initial_predicted_total_ns` is the starting incumbent cost,
+`first_improvement_ns` (when set) the elapsed time of the first strict improvement, `incumbent_improvements` the
+number of strict improvements, `search_work` the weighted search units spent, `search_granted_ns` the granted search
+window, `search_renewals` how many times the window was renewed, `search_discovery_used` whether discovery renewals
+were consumed, `search_overshoot_ns` the granted-window excess when the search stopped, `search_stop_phase` the phase
+at which it stopped (`none`, `setup`, `construction`, `assessment`, `expansion`, `refinement`), and
+`search_boundary_limited` whether an exhausted grant boundary stopped it. When the stop reason is
+`insufficient_expected_gain`, `search_budget_refusal` names the granular economic refusal (`none`,
+`completion_exceeds_remaining`, `completion_exceeds_economic_gain`, `discovery_not_eligible`,
+`discovery_already_used`, `no_progress_since_renewal`) so an elapsed/granted/renewal pair can be
+explained. `none` also covers wall- or boundary-limited stops. `search_budget_decision` carries the
+numeric values of the last search-budget renewal attempt — `elapsed_ns`, `granted_ns`,
+`remaining_allowance_ns`, `next_operation_ns`, `completion_ns`, `gain_ns`,
+`economic_gain_budget_ns` (the `gain / 20 / affected_requests` cap), and the
+`complete_prediction`, `discovery_eligible`, `discovery_used`, `progress`, `renewal_progress`
+flags. When `search_budget_refusal` is non-`none` this is the refused attempt, so it shows whether
+`completion_ns` was too high, `gain_ns` too low, or the economic cap too aggressive.
+
+The `discovery` object counts prefix-index candidates before planning: `prefix_index_entries`,
+`valid_prefix_index_entries`, `shortlist_matches`, `accepted_reuse_candidates`, and
+`best_reuse_prompt_tokens` (the largest reusable prefix among accepted candidates), plus one
+`rejected_*` counter per discovery filter (`invalid_prefix_index_entry`, `shortlist_key_mismatch`,
+`private_active_edge`, `inspect_admission`). The counters cover only occupied prefix-index entries,
+and each stage accounts for every counted entry, so:
+
+```text
+prefix_index_entries
+    = valid_prefix_index_entries
+    + rejected_invalid_prefix_index_entry
+
+valid_prefix_index_entries
+    = shortlist_matches
+    + rejected_shortlist_key_mismatch
+
+shortlist_matches
+    = accepted_reuse_candidates
+    + rejected_private_active_edge
+    + rejected_inspect_admission
+```
+
+apart from the invalid-candidate and inconsistent-plan `logic_error` paths, which abort the request
+rather than counting an entry. Every accepted candidate has a positive reusable prefix — planning
+rejects a zero-prefix candidate
+as invalid — so nonzero `accepted_reuse_candidates` (equivalently `best_reuse_prompt_tokens > 0`)
+separates a discovery failure (no candidate reached planning) from a reuse candidate that reached
+planning and selection and was lost there.
+
+The `candidates` array carries one identity-level trace per admission candidate: `reuse_path`,
+`physical_status`, `feasible`, `expandable`, `pressure_may_change_machine_work`,
+`logical_goal_available`, `candidate_seeded`, predicted cost, and the candidate's `targets_discovered`,
+`targets_assessed`, and `feasible_targets` pressure-search counts, with `best_assessed_target` (the
+planner-preferred selectable pressure target) when any was assessed. A target qualifies as
+preferred only if it is physically feasible **and** produced a logical goal; a feasible target
+without a goal can never replace the incumbent, so it is counted in `feasible_targets` but not
+recorded as best. Each target trace carries `logical_goal_available` to make that gating visible.
+The bounded search accounts targets
+globally rather than per candidate, so when per-candidate pressure accounting is unavailable those three
+counts stay at zero and the aggregate `targets_evaluated` covers the search. `initial_incumbent` and
+`selected_incumbent` name the candidate, `target_ordinal`, `reuse_path`, `root_maximal`,
+`degradation_units`, `reused_prompt_tokens`, and predicted cost of the search-start and final
+incumbents, tying the aggregate costs to a concrete admission candidate. `target_ordinal` is the
+candidate-opaque stable ordinal inside one planning session; it is only meaningful relative to the
+other traces of the same event.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
