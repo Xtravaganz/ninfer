@@ -350,14 +350,8 @@ public:
                 };
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
-                    if (entry.state != CatalogState::Catalogued) {
-                        ++discovery.rejected_private_not_catalogued;
-                        continue;
-                    }
-                    if (!entry.handle) {
-                        ++discovery.rejected_private_handle_missing;
-                        continue;
-                    }
+                    // valid_prefix_index_entry() already required Catalogued + handle for this
+                    // entry, so not_catalogued / handle_missing are never rejected here.
                     if (private_has_active_edge(index.slot)) {
                         ++discovery.rejected_private_active_edge;
                         continue;
@@ -403,14 +397,8 @@ public:
                 }
 
                 const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-                if (entry.state != SharedCatalogState::Catalogued) {
-                    ++discovery.rejected_shared_not_catalogued;
-                    continue;
-                }
-                if (!entry.handle) {
-                    ++discovery.rejected_shared_handle_missing;
-                    continue;
-                }
+                // valid_prefix_index_entry() already required Catalogued + handle for this entry,
+                // so not_catalogued / handle_missing are never rejected here.
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
                 if (!plan) {

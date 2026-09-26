@@ -24,7 +24,10 @@ namespace ninfer::serve {
 // granular economic refusal behind an `InsufficientExpectedGain` stop
 // (`search_budget_refusal`) and the per-target `logical_goal_available` flag that gates whether
 // a feasible target can be the planner-preferred (`best_assessed_target`) target.
-inline constexpr int kRequestLogSchemaVersion        = 22;
+// Schema version 23 removes the four unreachable discovery rejection counters
+// (`rejected_{private,shared}_{not_catalogued,handle_missing}`); `valid_prefix_index_entry()`
+// already folds those states into `rejected_invalid_prefix_index_entry`.
+inline constexpr int kRequestLogSchemaVersion        = 23;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

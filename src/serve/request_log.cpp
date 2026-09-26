@@ -326,11 +326,7 @@ Json materialization_discovery_json(const ninfer::MaterializationDiscoverySummar
                 {"rejected_invalid_prefix_index_entry",
                  discovery.rejected_invalid_prefix_index_entry},
                 {"rejected_shortlist_key_mismatch", discovery.rejected_shortlist_key_mismatch},
-                {"rejected_private_not_catalogued", discovery.rejected_private_not_catalogued},
-                {"rejected_private_handle_missing", discovery.rejected_private_handle_missing},
                 {"rejected_private_active_edge", discovery.rejected_private_active_edge},
-                {"rejected_shared_not_catalogued", discovery.rejected_shared_not_catalogued},
-                {"rejected_shared_handle_missing", discovery.rejected_shared_handle_missing},
                 {"rejected_inspect_admission", discovery.rejected_inspect_admission}};
 }
 

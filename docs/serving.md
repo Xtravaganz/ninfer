@@ -889,12 +889,13 @@ The `discovery` object counts prefix-index candidates before planning: `prefix_i
 `valid_prefix_index_entries`, `shortlist_matches`, `accepted_reuse_candidates`, and
 `best_reuse_prompt_tokens` (the largest reusable prefix among accepted candidates), plus one
 `rejected_*` counter per discovery filter (`invalid_prefix_index_entry`, `shortlist_key_mismatch`,
-`private_not_catalogued`, `private_handle_missing`, `private_active_edge`, `shared_not_catalogued`,
-`shared_handle_missing`, `inspect_admission`). The counters cover only occupied prefix-index entries,
+`private_active_edge`, `inspect_admission`). The counters cover only occupied prefix-index entries,
 so `valid_prefix_index_entries` plus `rejected_invalid_prefix_index_entry` equals
 `prefix_index_entries`, and `shortlist_matches` equals the accepted plus all rejection counts.
-`best_reuse_prompt_tokens = 0` with nonzero `accepted_reuse_candidates` can therefore separate a
-discovery failure from a reuse candidate that reached planning and selection and was lost there.
+Every accepted candidate has a positive reusable prefix — planning rejects a zero-prefix candidate
+as invalid — so nonzero `accepted_reuse_candidates` (equivalently `best_reuse_prompt_tokens > 0`)
+separates a discovery failure (no candidate reached planning) from a reuse candidate that reached
+planning and selection and was lost there.
 
 The `candidates` array carries one identity-level trace per admission candidate: `reuse_path`,
 `physical_status`, `feasible`, `expandable`, `pressure_may_change_machine_work`,

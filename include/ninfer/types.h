@@ -791,11 +791,7 @@ struct MaterializationDiscoverySummary {
     std::uint32_t best_reuse_prompt_tokens            = 0;
     std::uint32_t rejected_invalid_prefix_index_entry = 0;
     std::uint32_t rejected_shortlist_key_mismatch     = 0;
-    std::uint32_t rejected_private_not_catalogued     = 0;
-    std::uint32_t rejected_private_handle_missing     = 0;
     std::uint32_t rejected_private_active_edge        = 0;
-    std::uint32_t rejected_shared_not_catalogued      = 0;
-    std::uint32_t rejected_shared_handle_missing      = 0;
     std::uint32_t rejected_inspect_admission          = 0;
 
     [[nodiscard]] friend constexpr bool
