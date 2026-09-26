@@ -23,12 +23,25 @@ int main() {
         require(expensive.stop_reason() ==
                     ninfer::MaterializationStopReason::InsufficientExpectedGain,
                 "economic stopping was reported as wall exhaustion");
+        require(expensive.refusal_reason() ==
+                    ninfer::MaterializationBudgetRefusal::CompletionExceedsEconomicGain,
+                "economic stopping did not name the completion deadline sub-reason");
+
+        MaterializationSearchBudget late(idle, 0, 80'000 * ms);
+        require(!late.allow(49 * ms, 1, 2 * ms, 70'000 * ms, true, 1),
+                "completion past the wall deadline was granted");
+        require(late.refusal_reason() ==
+                    ninfer::MaterializationBudgetRefusal::CompletionExceedsRemaining,
+                "completion past the remaining window lost its sub-reason");
 
         MaterializationSearchBudget discovery(idle, 0, 80'000 * ms);
         require(discovery.allow(5 * ms, ms, 4 * ms, 70'000 * ms, false, 1),
                 "unknown candidate could not receive bounded discovery");
         require(!discovery.allow(10 * ms, ms, ms, 70'000 * ms, false, 2),
                 "unknown candidate repeatedly renewed discovery");
+        require(discovery.refusal_reason() ==
+                    ninfer::MaterializationBudgetRefusal::DiscoveryAlreadyUsed,
+                "spent discovery episode lost its sub-reason");
         require(discovery.allow(10 * ms, ms, ms, 70'000 * ms, true, 2),
                 "complete prediction could not continue after discovery");
 
@@ -59,6 +72,9 @@ int main() {
         MaterializationSearchBudget seeded(idle, 0, 80'000 * ms);
         require(!seeded.allow(5 * ms, ms, ms, 70'000 * ms, false, 1, false),
                 "an already-seeded candidate renewed solely on an incomplete optimistic estimate");
+        require(seeded.refusal_reason() ==
+                    ninfer::MaterializationBudgetRefusal::DiscoveryNotEligible,
+                "not-eligible source lost its sub-reason");
         require(seeded.allow(5 * ms, ms, ms, 70'000 * ms, true, 1, false),
                 "a complete profitable refinement was denied after seeding");
         std::atomic<bool> cancelled{false};
@@ -72,6 +88,9 @@ int main() {
         require(stalled.allow(5 * ms, ms, ms, 70'000 * ms, true, 7), "first forecast grant failed");
         require(!stalled.allow(10 * ms, ms, ms, 70'000 * ms, true, 7),
                 "stalled work renewed its allowance");
+        require(stalled.refusal_reason() ==
+                    ninfer::MaterializationBudgetRefusal::NoProgressSinceRenewal,
+                "stalled renewal lost its sub-reason");
         std::cout << "ok\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

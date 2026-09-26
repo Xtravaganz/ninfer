@@ -2348,6 +2348,78 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
             "pressure search did not record an expandable candidate trace");
 }
 
+// A physically feasible pressure target without a logical goal can never become the incumbent.
+// The trace must still count it in `feasible_targets` but must not record it as
+// `best_assessed_target`, which is the planner-preferred *selectable* target. Separating the two
+// keeps the trace honest when `logical_goal()` is checked after physical feasibility.
+void test_feasible_pressure_target_without_goal_is_not_best() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+
+    FakeProgram program;
+    program.pressure_action_immediate_ns          = 0;
+    program.pressure_action_degradation_units     = 1;
+    program.pressure_target_immediate_ns_override = 100'000'000;
+
+    FakeAdmissionCandidate candidate;
+    set_fake_machine_costs(candidate.identity.machine_work, 100'000'000, 1'000'000'000);
+    candidate.identity.machine_work.candidate_transfers[2].copy_operations = 1;
+    candidate.identity.pressure_may_change_machine_work                    = true;
+    candidate.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    candidate.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    candidate.identity.assessment_digest = 17;
+
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate               = &candidate,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+    };
+    FakeContinuationHandle owner{9, 0};
+    const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
+    const std::array<PlanningOwnerId, 1> private_owner_ids{PlanningOwnerId{.value = 0}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = PlanningOwnerId{.value = 0}},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 100,
+        },
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    // The identity call carries no owner outcomes; every assessed pressure target does.
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+        -> std::optional<Planner::LogicalGoal> {
+        if (!outcomes.empty()) { return std::nullopt; }
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->plan && result->candidate == PlanningCandidateId{.value = 0},
+            "selectable identity root was not sealed when pressure targets had no logical goal");
+    require(result && result->diagnostics.candidates.size() == 1 &&
+                result->diagnostics.candidates[0].candidate_seeded &&
+                result->diagnostics.candidates[0].feasible_targets >= 1 &&
+                !result->diagnostics.candidates[0].best_assessed_target,
+            "feasible pressure target without a logical goal was recorded as best selectable");
+}
+
 void test_dominating_identity_does_not_build_pressure_graph() {
     using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
@@ -3621,6 +3693,8 @@ int main() {
              test_candidate_search_prefers_deep_reuse_without_eviction);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
+    run_test("feasible pressure target without goal is not best",
+             test_feasible_pressure_target_without_goal_is_not_best);
     run_test("large reuse cannot explore before time budget",
              test_cannot_explore_large_reuse_search_stops_leaves_root);
     run_test("dominating identity fast path",

@@ -249,10 +249,13 @@ public:
         // assessed counts are keyed to the target's own ordinal so repeated marks and the pending
         // assessment of an already-seen child do not double count. `targets_discovered` covers
         // pressure search only; the identity target is described by `identity_target_ordinal` and
-        // `candidate_seeded`.
+        // `candidate_seeded`. The planner-preferred target must be selectable: a physically
+        // feasible target without a logical goal can never become the incumbent, so it is counted
+        // in `feasible_targets` but is not recorded as `best_assessed_target`.
         const auto record_assessment = [&](std::uint32_t candidate_index,
                                            const PressureTargetAssessment& assessment,
-                                           const FoldedCost& cost) {
+                                           const FoldedCost& cost,
+                                           bool logical_goal_available) {
             MaterializationCandidateTrace& trace = candidate_traces[candidate_index];
             if (!target_marked(cost.target_ordinal, kTargetDiscovered)) {
                 ++trace.targets_discovered;
@@ -261,10 +264,12 @@ public:
             ++trace.targets_assessed;
             if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) { return; }
             ++trace.feasible_targets;
+            if (!logical_goal_available) { return; }
             std::optional<FoldedCost>& best = candidate_best_cost[candidate_index];
             if (!best || cost.less(*best)) {
                 best = cost;
-                trace.best_assessed_target = target_trace(cost, assessment);
+                trace.best_assessed_target =
+                    target_trace(cost, assessment, /*logical_goal_available=*/true);
             }
         };
 
@@ -292,9 +297,10 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
+            // Read the assessment before make_incumbent moves it into the incumbent.
+            record_assessment(root_candidate_index, assessment, cost, goal.has_value());
             incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
                                        std::move(assessed), cost, *goal);
-            record_assessment(root_candidate_index, assessment, cost);
         }
 
         if (!identity_best) { search_started = Clock::now(); }
@@ -396,12 +402,12 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
-            record_assessment(expected_candidate, assessment, cost);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            record_assessment(expected_candidate, assessment, cost, goal.has_value());
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
@@ -623,6 +629,7 @@ public:
                     path.visited.push_back(chosen.stable_target_ordinal);
                     if (!target_marked(chosen.stable_target_ordinal, kTargetDiscovered)) {
                         mark_target(chosen.stable_target_ordinal, kTargetDiscovered);
+                        ++candidate_traces[path.candidate_index].targets_discovered;
                         ++optional_targets;
                         pending_push({.target          = *target,
                                       .candidate_index = path.candidate_index,
@@ -779,6 +786,7 @@ public:
         diagnostics.search_discovery_used      = search_budget.discovery_used();
         diagnostics.search_stop_phase          = search_phase;
         diagnostics.search_boundary_limited    = search_budget.boundary_limited();
+        diagnostics.search_budget_refusal      = search_budget.refusal_reason();
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
@@ -1448,10 +1456,12 @@ private:
     // Condensed trace of one assessed pressure target, from the folded cost the planner already
     // produced and the assessment it came from.
     [[nodiscard]] static MaterializationTargetTrace
-    target_trace(const FoldedCost& cost, const PressureTargetAssessment& assessment) noexcept {
+    target_trace(const FoldedCost& cost, const PressureTargetAssessment& assessment,
+                 bool logical_goal_available) noexcept {
         return MaterializationTargetTrace{
             .target_ordinal           = cost.target_ordinal,
             .root_maximal             = assessment.root_maximal,
+            .logical_goal_available   = logical_goal_available,
             .degradation_units        = assessment.degradation_units,
             .reused_prompt_tokens     = static_cast<std::uint32_t>(cost.reused_prompt_tokens),
             .remaining_prefill_tokens =

@@ -439,6 +439,10 @@ int main() {
                           .search_renewals            = 1,
                           .search_discovery_used      = true,
                           .search_overshoot_ns        = 0,
+                          .search_stop_phase = ninfer::MaterializationSearchPhase::Assessment,
+                          .search_boundary_limited    = false,
+                          .search_budget_refusal =
+                              ninfer::MaterializationBudgetRefusal::CompletionExceedsEconomicGain,
     };
     {
         // Candidate traces are built field-by-field because assigning the optional
@@ -555,8 +559,10 @@ int main() {
             done.at("materialization").at("selected_incumbent").at("predicted_total_ns") ==
                 240000 &&
             done.at("materialization").at("search_work") == 42 &&
-            done.at("materialization").at("search_stop_phase") == "none" &&
+            done.at("materialization").at("search_stop_phase") == "assessment" &&
             done.at("materialization").at("search_boundary_limited") == false &&
+            done.at("materialization").at("search_budget_refusal") ==
+                "completion_exceeds_economic_gain" &&
             done.at("materialization").at("candidates").size() == 2 &&
             done.at("materialization").at("candidates").at(0).at("physical_status") == "feasible" &&
             done.at("materialization").at("candidates").at(0).at("source_mode") ==

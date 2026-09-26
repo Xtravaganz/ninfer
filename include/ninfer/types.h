@@ -734,6 +734,38 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
     return "no_pressure";
 }
 
+// Granular reason an economic refusal hit the bounded search. The coarse stop reason
+// `InsufficientExpectedGain` collapses several distinct refusals; a trace can only explain a
+// given elapsed/granted/renewal pair if it can name which one fired. `None` means the last
+// decision was granted, or the refusal was wall/boundary driven (a `TimeBudget` stop).
+enum class MaterializationBudgetRefusal : std::uint8_t {
+    None,
+    CompletionExceedsRemaining,    // completion_ns exceeds allowance.remaining(now)
+    CompletionExceedsEconomicGain, // completion_ns exceeds the economic cap on the forecast gain
+    DiscoveryNotEligible,          // incomplete forecast, caller marks the source not eligible
+    DiscoveryAlreadyUsed,          // incomplete forecast, the discovery episode was already spent
+    NoProgressSinceRenewal,        // progress has not advanced past the previous renewal
+};
+
+[[nodiscard]] inline constexpr const char*
+materialization_budget_refusal_name(MaterializationBudgetRefusal refusal) noexcept {
+    switch (refusal) {
+    case MaterializationBudgetRefusal::None:
+        return "none";
+    case MaterializationBudgetRefusal::CompletionExceedsRemaining:
+        return "completion_exceeds_remaining";
+    case MaterializationBudgetRefusal::CompletionExceedsEconomicGain:
+        return "completion_exceeds_economic_gain";
+    case MaterializationBudgetRefusal::DiscoveryNotEligible:
+        return "discovery_not_eligible";
+    case MaterializationBudgetRefusal::DiscoveryAlreadyUsed:
+        return "discovery_already_used";
+    case MaterializationBudgetRefusal::NoProgressSinceRenewal:
+        return "no_progress_since_renewal";
+    }
+    return "none";
+}
+
 // Public mirror of the runtime projection-status enum so the request log does not depend on
 // runtime/contract headers.
 enum class MaterializationProjectionStatus : std::uint8_t {
@@ -775,6 +807,9 @@ struct MaterializationDiscoverySummary {
 struct MaterializationTargetTrace {
     std::uint32_t target_ordinal           = 0;
     bool root_maximal                      = false;
+    // Whether the assessed target also produced a logical goal. A physically feasible target with
+    // no goal can never replace the incumbent, so it cannot be the planner-preferred target.
+    bool logical_goal_available            = false;
     std::uint32_t degradation_units        = 0;
     std::uint32_t reused_prompt_tokens     = 0;
     std::uint32_t remaining_prefill_tokens = 0;
@@ -905,6 +940,9 @@ struct MaterializationDiagnostics {
     std::uint64_t search_overshoot_ns            = 0;
     MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
     bool search_boundary_limited                 = false;
+    // Granular economic refusal behind an `InsufficientExpectedGain` stop, `none` when the stop
+    // was granted, wall/boundary driven, or the search did not hit the budget.
+    MaterializationBudgetRefusal search_budget_refusal = MaterializationBudgetRefusal::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

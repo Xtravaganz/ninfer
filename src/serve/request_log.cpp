@@ -349,6 +349,7 @@ Json materialization_incumbent_json(const ninfer::MaterializationIncumbentTrace&
 Json materialization_target_json(const ninfer::MaterializationTargetTrace& target) {
     return Json{{"target_ordinal", target.target_ordinal},
                 {"root_maximal", target.root_maximal},
+                {"logical_goal_available", target.logical_goal_available},
                 {"degradation_units", target.degradation_units},
                 {"reused_prompt_tokens", target.reused_prompt_tokens},
                 {"remaining_prefill_tokens", target.remaining_prefill_tokens},
@@ -425,6 +426,8 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_stop_phase",
          ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
         {"search_boundary_limited", diagnostics.search_boundary_limited},
+        {"search_budget_refusal",
+         ninfer::materialization_budget_refusal_name(diagnostics.search_budget_refusal)},
     };
     Json candidates = Json::array();
     for (const ninfer::MaterializationCandidateTrace& candidate : diagnostics.candidates) {

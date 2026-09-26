@@ -879,7 +879,11 @@ number of strict improvements, `search_work` the weighted search units spent, `s
 window, `search_renewals` how many times the window was renewed, `search_discovery_used` whether discovery renewals
 were consumed, `search_overshoot_ns` the granted-window excess when the search stopped, `search_stop_phase` the phase
 at which it stopped (`none`, `setup`, `construction`, `assessment`, `expansion`, `refinement`), and
-`search_boundary_limited` whether an exhausted grant boundary stopped it.
+`search_boundary_limited` whether an exhausted grant boundary stopped it. When the stop reason is
+`insufficient_expected_gain`, `search_budget_refusal` names the granular economic refusal (`none`,
+`completion_exceeds_remaining`, `completion_exceeds_economic_gain`, `discovery_not_eligible`,
+`discovery_already_used`, `no_progress_since_renewal`) so an elapsed/granted/renewal pair can be
+explained. `none` also covers wall- or boundary-limited stops.
 
 The `discovery` object counts prefix-index candidates before planning: `prefix_index_entries`,
 `valid_prefix_index_entries`, `shortlist_matches`, `accepted_reuse_candidates`, and
@@ -896,7 +900,11 @@ The `candidates` array carries one identity-level trace per admission candidate:
 `physical_status`, `feasible`, `expandable`, `pressure_may_change_machine_work`,
 `logical_goal_available`, `candidate_seeded`, predicted cost, and the candidate's `targets_discovered`,
 `targets_assessed`, and `feasible_targets` pressure-search counts, with `best_assessed_target` (the
-planner-preferred assessed pressure target) when any was assessed. The bounded search accounts targets
+planner-preferred selectable pressure target) when any was assessed. A target qualifies as
+preferred only if it is physically feasible **and** produced a logical goal; a feasible target
+without a goal can never replace the incumbent, so it is counted in `feasible_targets` but not
+recorded as best. Each target trace carries `logical_goal_available` to make that gating visible.
+The bounded search accounts targets
 globally rather than per candidate, so when per-candidate pressure accounting is unavailable those three
 counts stay at zero and the aggregate `targets_evaluated` covers the search. `initial_incumbent` and
 `selected_incumbent` name the candidate, `target_ordinal`, `reuse_path`, `root_maximal`,

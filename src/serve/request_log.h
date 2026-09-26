@@ -20,10 +20,11 @@ class logger;
 
 namespace ninfer::serve {
 
-// Schema version 21 adds the request-owned materialization planning traces: discovery rejection
-// counters and best reusable prefix, per-candidate identity/pressure traces with assessment
-// counts, initial/selected incumbent identity, and the bounded-search stop facts.
-inline constexpr int kRequestLogSchemaVersion        = 21;
+// Schema version 22 adds request-owned materialization planning detail on top of v21: the
+// granular economic refusal behind an `InsufficientExpectedGain` stop
+// (`search_budget_refusal`) and the per-target `logical_goal_available` flag that gates whether
+// a feasible target can be the planner-preferred (`best_assessed_target`) target.
+inline constexpr int kRequestLogSchemaVersion        = 22;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
