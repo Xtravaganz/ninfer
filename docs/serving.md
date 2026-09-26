@@ -883,16 +883,39 @@ at which it stopped (`none`, `setup`, `construction`, `assessment`, `expansion`,
 `insufficient_expected_gain`, `search_budget_refusal` names the granular economic refusal (`none`,
 `completion_exceeds_remaining`, `completion_exceeds_economic_gain`, `discovery_not_eligible`,
 `discovery_already_used`, `no_progress_since_renewal`) so an elapsed/granted/renewal pair can be
-explained. `none` also covers wall- or boundary-limited stops.
+explained. `none` also covers wall- or boundary-limited stops. `search_budget_decision` carries the
+numeric values of the last search-budget renewal attempt — `elapsed_ns`, `granted_ns`,
+`remaining_allowance_ns`, `next_operation_ns`, `completion_ns`, `gain_ns`,
+`economic_gain_budget_ns` (the `gain / 20 / affected_requests` cap), and the
+`complete_prediction`, `discovery_eligible`, `discovery_used`, `progress`, `renewal_progress`
+flags. When `search_budget_refusal` is non-`none` this is the refused attempt, so it shows whether
+`completion_ns` was too high, `gain_ns` too low, or the economic cap too aggressive.
 
 The `discovery` object counts prefix-index candidates before planning: `prefix_index_entries`,
 `valid_prefix_index_entries`, `shortlist_matches`, `accepted_reuse_candidates`, and
 `best_reuse_prompt_tokens` (the largest reusable prefix among accepted candidates), plus one
 `rejected_*` counter per discovery filter (`invalid_prefix_index_entry`, `shortlist_key_mismatch`,
 `private_active_edge`, `inspect_admission`). The counters cover only occupied prefix-index entries,
-so `valid_prefix_index_entries` plus `rejected_invalid_prefix_index_entry` equals
-`prefix_index_entries`, and `shortlist_matches` equals the accepted plus all rejection counts.
-Every accepted candidate has a positive reusable prefix — planning rejects a zero-prefix candidate
+and each stage accounts for every counted entry, so:
+
+```text
+prefix_index_entries
+    = valid_prefix_index_entries
+    + rejected_invalid_prefix_index_entry
+
+valid_prefix_index_entries
+    = shortlist_matches
+    + rejected_shortlist_key_mismatch
+
+shortlist_matches
+    = accepted_reuse_candidates
+    + rejected_private_active_edge
+    + rejected_inspect_admission
+```
+
+apart from the invalid-candidate and inconsistent-plan `logic_error` paths, which abort the request
+rather than counting an entry. Every accepted candidate has a positive reusable prefix — planning
+rejects a zero-prefix candidate
 as invalid — so nonzero `accepted_reuse_candidates` (equivalently `best_reuse_prompt_tokens > 0`)
 separates a discovery failure (no candidate reached planning) from a reuse candidate that reached
 planning and selection and was lost there.

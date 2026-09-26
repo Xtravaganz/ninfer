@@ -787,6 +787,7 @@ public:
         diagnostics.search_stop_phase          = search_phase;
         diagnostics.search_boundary_limited    = search_budget.boundary_limited();
         diagnostics.search_budget_refusal      = search_budget.refusal_reason();
+        diagnostics.search_budget_decision     = search_budget.decision_trace();
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;

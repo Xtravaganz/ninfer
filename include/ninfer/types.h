@@ -766,6 +766,32 @@ materialization_budget_refusal_name(MaterializationBudgetRefusal refusal) noexce
     return "none";
 }
 
+// Numeric values of the last search-budget renewal attempt, captured when the bounded search
+// asks for the next grant or extension. Together with `search_budget_refusal` this explains an
+// `insufficient_expected_gain` stop: the refusal name alone cannot say whether `completion_ns`
+// was too high, `gain_ns` too low, or the `gain / 20 / affected_requests` economy too tight.
+// A `none` refusal with `budget_exhausted` is a wall/boundary stop; the trace then carries the
+// values that bound the grant. With no refusal and no exhaustion the trace holds the last
+// granted attempt, which is harmless next to `search_budget_refusal == none`.
+struct MaterializationBudgetDecisionTrace {
+    std::uint64_t elapsed_ns              = 0;
+    std::uint64_t granted_ns              = 0;
+    std::uint64_t remaining_allowance_ns  = 0;
+    std::uint64_t next_operation_ns       = 0;
+    std::uint64_t completion_ns           = 0;
+    std::uint64_t gain_ns                 = 0;
+    std::uint64_t economic_gain_budget_ns = 0;
+    bool complete_prediction              = false;
+    bool discovery_eligible               = false;
+    bool discovery_used                   = false;
+    std::uint64_t progress                = 0;
+    std::uint64_t renewal_progress        = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationBudgetDecisionTrace&,
+               const MaterializationBudgetDecisionTrace&) noexcept = default;
+};
+
 // Public mirror of the runtime projection-status enum so the request log does not depend on
 // runtime/contract headers.
 enum class MaterializationProjectionStatus : std::uint8_t {
@@ -939,6 +965,9 @@ struct MaterializationDiagnostics {
     // Granular economic refusal behind an `InsufficientExpectedGain` stop, `none` when the stop
     // was granted, wall/boundary driven, or the search did not hit the budget.
     MaterializationBudgetRefusal search_budget_refusal = MaterializationBudgetRefusal::None;
+    // Numeric values of the last renewal attempt, the refused attempt when
+    // `search_budget_refusal` is non-`none`.
+    MaterializationBudgetDecisionTrace search_budget_decision;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

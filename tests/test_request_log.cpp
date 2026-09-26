@@ -443,6 +443,20 @@ int main() {
                           .search_boundary_limited    = false,
                           .search_budget_refusal =
                               ninfer::MaterializationBudgetRefusal::CompletionExceedsEconomicGain,
+                          .search_budget_decision = {
+                              .elapsed_ns              = 4999026,
+                              .granted_ns              = 8000,
+                              .remaining_allowance_ns  = 44900000,
+                              .next_operation_ns       = 20000,
+                              .completion_ns           = 340000,
+                              .gain_ns                 = 5000000,
+                              .economic_gain_budget_ns = 250000,
+                              .complete_prediction     = false,
+                              .discovery_eligible      = true,
+                              .discovery_used          = false,
+                              .progress                = 36,
+                              .renewal_progress        = 0,
+                          },
     };
     {
         // Candidate traces are built field-by-field because assigning the optional
@@ -563,6 +577,17 @@ int main() {
             done.at("materialization").at("search_boundary_limited") == false &&
             done.at("materialization").at("search_budget_refusal") ==
                 "completion_exceeds_economic_gain" &&
+            done.at("materialization").at("search_budget_decision").at("elapsed_ns") == 4999026 &&
+            done.at("materialization").at("search_budget_decision").at("granted_ns") == 8000 &&
+            done.at("materialization").at("search_budget_decision").at("remaining_allowance_ns") ==
+                44900000 &&
+            done.at("materialization").at("search_budget_decision").at("completion_ns") == 340000 &&
+            done.at("materialization").at("search_budget_decision").at("gain_ns") == 5000000 &&
+            done.at("materialization").at("search_budget_decision").at("economic_gain_budget_ns") ==
+                250000 &&
+            done.at("materialization").at("search_budget_decision").at("complete_prediction") ==
+                false &&
+            done.at("materialization").at("search_budget_decision").at("progress") == 36 &&
             done.at("materialization").at("candidates").size() == 2 &&
             done.at("materialization").at("candidates").at(0).at("physical_status") == "feasible" &&
             done.at("materialization").at("candidates").at(0).at("source_mode") ==

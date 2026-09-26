@@ -63,6 +63,20 @@ public:
         const std::uint64_t remaining = allowance_.remaining(now);
         next_operation_ns             = std::max<std::uint64_t>(1, next_operation_ns);
         completion_ns                 = std::max(next_operation_ns, completion_ns);
+        decision_                     = MaterializationBudgetDecisionTrace{
+            .elapsed_ns              = elapsed,
+            .granted_ns              = granted_,
+            .remaining_allowance_ns  = remaining,
+            .next_operation_ns       = next_operation_ns,
+            .completion_ns           = completion_ns,
+            .gain_ns                 = gain_ns,
+            .economic_gain_budget_ns = economic(gain_ns),
+            .complete_prediction     = complete_prediction,
+            .discovery_eligible      = discovery_eligible,
+            .discovery_used          = discovery_used_,
+            .progress                = progress,
+            .renewal_progress        = renewal_progress_,
+        };
         if (next_operation_ns > remaining) {
             boundary_limited_ = true;
             reason_           = MaterializationStopReason::TimeBudget;
@@ -118,6 +132,10 @@ public:
         return refusal_;
     }
 
+    [[nodiscard]] const MaterializationBudgetDecisionTrace& decision_trace() const noexcept {
+        return decision_;
+    }
+
     [[nodiscard]] MaterializationStopReason stop_reason() const noexcept { return reason_; }
 
     [[nodiscard]] std::uint64_t overshoot(std::uint64_t now) const noexcept {
@@ -140,6 +158,7 @@ private:
     bool discovery_used_              = false;
     MaterializationBudgetRefusal refusal_ = MaterializationBudgetRefusal::None;
     MaterializationStopReason reason_     = MaterializationStopReason::TimeBudget;
+    MaterializationBudgetDecisionTrace decision_;
 };
 
 } // namespace ninfer::runtime

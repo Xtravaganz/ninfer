@@ -393,6 +393,22 @@ Json materialization_candidate_json(const ninfer::MaterializationCandidateTrace&
                 {"best_assessed_target", std::move(best_assessed_target)}};
 }
 
+Json materialization_budget_decision_json(
+    const ninfer::MaterializationBudgetDecisionTrace& decision) {
+    return Json{{"elapsed_ns", decision.elapsed_ns},
+                {"granted_ns", decision.granted_ns},
+                {"remaining_allowance_ns", decision.remaining_allowance_ns},
+                {"next_operation_ns", decision.next_operation_ns},
+                {"completion_ns", decision.completion_ns},
+                {"gain_ns", decision.gain_ns},
+                {"economic_gain_budget_ns", decision.economic_gain_budget_ns},
+                {"complete_prediction", decision.complete_prediction},
+                {"discovery_eligible", decision.discovery_eligible},
+                {"discovery_used", decision.discovery_used},
+                {"progress", decision.progress},
+                {"renewal_progress", decision.renewal_progress}};
+}
+
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
     Json result{
         {"predicted_now_ns", diagnostics.predicted_now_ns},
@@ -424,6 +440,8 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_boundary_limited", diagnostics.search_boundary_limited},
         {"search_budget_refusal",
          ninfer::materialization_budget_refusal_name(diagnostics.search_budget_refusal)},
+        {"search_budget_decision",
+         materialization_budget_decision_json(diagnostics.search_budget_decision)},
     };
     Json candidates = Json::array();
     for (const ninfer::MaterializationCandidateTrace& candidate : diagnostics.candidates) {

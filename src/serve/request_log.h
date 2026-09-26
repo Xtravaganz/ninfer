@@ -27,7 +27,10 @@ namespace ninfer::serve {
 // Schema version 23 removes the four unreachable discovery rejection counters
 // (`rejected_{private,shared}_{not_catalogued,handle_missing}`); `valid_prefix_index_entry()`
 // already folds those states into `rejected_invalid_prefix_index_entry`.
-inline constexpr int kRequestLogSchemaVersion        = 23;
+// Schema version 24 adds `search_budget_decision`, the numeric values of the last search-budget
+// renewal attempt behind `search_budget_refusal` (elapsed/granted/remaining allowance,
+// operation/completion/gain/economic-gain-budget estimates, and the prediction/progress flags).
+inline constexpr int kRequestLogSchemaVersion        = 24;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
