@@ -16,13 +16,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <int Capacity, class Schedule>
+template <class Geometry, int Capacity, class Schedule>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped_ksplit_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, std::int32_t valid_rows,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, int columns) {
-    using Geometry           = Q8LinearGeometry<248320, 5120>;
     constexpr int kHidden    = Geometry::kInputRows;
     constexpr int kTileK     = Schedule::kTileKPerWarp;
     constexpr int kWarps     = Schedule::kKWarps;
@@ -267,11 +266,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
 using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const LinearTopKWorkspace&,
                         cudaStream_t);
 
-template <int Capacity>
-void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
-                 const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+template <class Geometry, int Capacity>
+void launch_tile_geometry(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
+                          const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     using Schedule = Q8KSplitSchedule<8, Capacity, 2, Q8KSplitScaleAccess::Shared>;
-    q8_grouped_ksplit_topk_kernel<Capacity, Schedule>
+    q8_grouped_ksplit_topk_kernel<Geometry, Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
             static_cast<const std::uint8_t*>(head.qdata),
@@ -279,6 +278,20 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
             static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
             hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Capacity>
+void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
+                 const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+    if (head.n == kLinearTopKCompactRows) {
+        return launch_tile_geometry<Q8LinearGeometry<180096, 5120>, Capacity>(
+            hidden, head, valid_rows, workspace, stream);
+    }
+    if (head.n == kLinearTopKFullRows) {
+        return launch_tile_geometry<Q8LinearGeometry<248320, 5120>, Capacity>(
+            hidden, head, valid_rows, workspace, stream);
+    }
+    throw std::invalid_argument("linear_topk Q8: unsupported physical vocabulary rows");
 }
 
 template <std::size_t... Indices>
