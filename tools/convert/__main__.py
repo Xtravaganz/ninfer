@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import importlib.util
 from pathlib import Path
 import sys
+import torch
 from collections.abc import Mapping
 
 from .official_recipes import RECIPES
@@ -123,6 +124,23 @@ def main(argv=None):
         help="include the existing indexed proposal head",
     )
     parser.add_argument("--proposal-rows", type=int, default=131072)
+    parser.add_argument(
+        "--vocab-map",
+        type=Path,
+        help=(
+            "Optional little-endian int32 new-to-old vocabulary row mapping. "
+            "Its number of entries defines the public/tokenizer vocabulary size."
+        ),
+    )
+    parser.add_argument(
+        "--vocab-physical-rows",
+        type=int,
+        help=(
+            "Physical embedding/output-head row count when --vocab-map is used. "
+            "May exceed the public vocabulary size to provide kernel-aligned padding rows. "
+            "Defaults to the number of --vocab-map entries."
+        ),
+    )
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
     parser.add_argument("--name", help="public instance name saved in metadata")
     parser.add_argument("--out", type=Path, required=True)
@@ -130,6 +148,39 @@ def main(argv=None):
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
     args = parser.parse_args(argv)
+    vocab_indices = None
+
+    if args.vocab_physical_rows is not None and args.vocab_map is None:
+        raise ValueError("--vocab-physical-rows requires --vocab-map")
+
+    if args.vocab_physical_rows is not None and args.vocab_physical_rows <= 0:
+        raise ValueError("--vocab-physical-rows must be positive")
+
+    if args.vocab_map is not None:
+        data = args.vocab_map.read_bytes()
+
+        if not data or len(data) % 4:
+            raise ValueError(
+                "--vocab-map must contain complete little-endian int32 entries"
+            )
+
+        vocab_indices = torch.frombuffer(
+            bytearray(data),
+            dtype=torch.int32,
+        ).clone()
+
+        logical_rows = int(vocab_indices.numel())
+        physical_rows = (
+            logical_rows
+            if args.vocab_physical_rows is None
+            else args.vocab_physical_rows
+        )
+
+        print(
+            f"vocab map: {args.vocab_map} "
+            f"(public={logical_rows:,}, physical={physical_rows:,})",
+            flush=True,
+        )
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
@@ -148,6 +199,8 @@ def main(argv=None):
             components=components,
             companions=companions,
             resource_overrides=overrides,
+            vocab_indices=vocab_indices,
+            vocab_physical_rows=args.vocab_physical_rows,
         )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)

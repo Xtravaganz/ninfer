@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from math import prod
 from typing import Callable
@@ -76,43 +77,112 @@ def select_rows(
 ) -> LogicalSource:
     if len(source.shape) != 2 or not ranges:
         raise ValueError("row selection requires a matrix and nonempty ranges")
+
     n, k = source.shape
+    ranges = tuple((int(begin), int(end)) for begin, end in ranges)
+
+    # Precompute cumulative flattened-element endpoints once.
+    #
+    # The old implementation restarted from ranges[0] for every read.
+    # Nested gathers (for example pruned full head -> proposal head) could
+    # therefore become quadratic in the number of selected rows.
+    cumulative_ends = []
+    cursor = 0
+
     for begin, end in ranges:
         if not 0 <= begin < end <= n:
-            raise ValueError(f"{source.label}: invalid selected rows [{begin},{end})")
-    rows = sum(end - begin for begin, end in ranges)
+            raise ValueError(
+                f"{source.label}: invalid selected rows [{begin},{end})"
+            )
+
+        cursor += (end - begin) * k
+        cumulative_ends.append(cursor)
+
+    total_elements = cursor
+    rows = total_elements // k
 
     def spans(begin: int, end: int):
-        cursor = 0
-        for first, last in ranges:
-            length = (last - first) * k
-            low, high = max(begin, cursor), min(end, cursor + length)
+        if begin == end:
+            return
+
+        # First selected range whose cumulative end is strictly after begin.
+        index = bisect_right(cumulative_ends, begin)
+
+        range_begin = (
+            0 if index == 0 else cumulative_ends[index - 1]
+        )
+
+        while index < len(ranges) and range_begin < end:
+            first, _last = ranges[index]
+            range_end = cumulative_ends[index]
+
+            low = max(begin, range_begin)
+            high = min(end, range_end)
+
             if low < high:
-                yield first * k + low - cursor, first * k + high - cursor
-            cursor += length
+                yield (
+                    first * k + low - range_begin,
+                    first * k + high - range_begin,
+                )
+
+            range_begin = range_end
+            index += 1
 
     def read(begin: int, end: int) -> torch.Tensor:
         if begin == end:
             return source.values(0, 0)
-        parts = [source.values(a, b) for a, b in spans(begin, end)]
+
+        parts = [
+            source.values(a, b)
+            for a, b in spans(begin, end)
+        ]
+
+        if not parts:
+            raise RuntimeError(
+                f"{source.label}: row selection produced no source spans"
+            )
+
         return torch.cat(parts) if len(parts) != 1 else parts[0]
 
     def encoded(begin: int, end: int) -> EncodedRows:
         if source.read_encoded is None:
-            raise ValueError(f"{source.label}: encoded source rows are unavailable")
+            raise ValueError(
+                f"{source.label}: encoded source rows are unavailable"
+            )
+
         pieces = [
-            source.read_encoded(a // k, b // k) for a, b in spans(begin * k, end * k)
+            source.read_encoded(a // k, b // k)
+            for a, b in spans(begin * k, end * k)
         ]
+
+        if not pieces:
+            raise RuntimeError(
+                f"{source.label}: encoded row selection produced no spans"
+            )
+
         first = pieces[0]
+
         if any(
-            (part.format, part.weight_divisor) != (first.format, first.weight_divisor)
+            (part.format, part.weight_divisor)
+            != (first.format, first.weight_divisor)
             for part in pieces
         ):
-            raise ValueError(f"{source.label}: incompatible encoded row groups")
+            raise ValueError(
+                f"{source.label}: incompatible encoded row groups"
+            )
+
         return EncodedRows(
             first.format,
-            torch.cat([p.codes for p in pieces]),
-            torch.cat([p.scales for p in pieces]),
+            (
+                torch.cat([p.codes for p in pieces])
+                if len(pieces) != 1
+                else first.codes
+            ),
+            (
+                torch.cat([p.scales for p in pieces])
+                if len(pieces) != 1
+                else first.scales
+            ),
             first.weight_divisor,
         )
 
@@ -129,7 +199,33 @@ def select_rows(
 def gather_source(source: LogicalSource, indices: torch.Tensor) -> LogicalSource:
     if len(source.shape) != 2:
         raise ValueError("gather source must be a matrix")
+
     ids = indices.to(torch.int64).cpu().tolist()
+
     if not ids or min(ids) < 0 or max(ids) >= source.shape[0]:
         raise ValueError("gather indices are outside source rows")
-    return select_rows(source, tuple((row, row + 1) for row in ids))
+
+    # Preserve exact gather order, but collapse adjacent increasing IDs:
+    #
+    #   5, 6, 7, 20, 21, 4
+    # becomes
+    #   (5, 8), (20, 22), (4, 5)
+    #
+    # Duplicates and non-consecutive/reordered rows remain separate, so
+    # gather semantics are unchanged.
+    ranges = []
+    first = ids[0]
+    previous = ids[0]
+
+    for row in ids[1:]:
+        if row == previous + 1:
+            previous = row
+            continue
+
+        ranges.append((first, previous + 1))
+        first = row
+        previous = row
+
+    ranges.append((first, previous + 1))
+
+    return select_rows(source, tuple(ranges))

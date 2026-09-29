@@ -13,7 +13,9 @@ from typing import Mapping
 
 from .model import Model, Parameter
 from .resources import load_resources
-from .sources.logical import LogicalSource, select_rows, transpose_source
+from .sources.logical import LogicalSource, gather_source, select_rows, transpose_source
+## new line for shorter vocabulary!!!
+#from .sources.logical import LogicalSource, select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
 
@@ -903,13 +905,22 @@ class _Builder:
                     (target["vocab_size"], rank),
                 )
 
-
+## change for a shorter vocabulary
+#def build_model(
+#    base: SafetensorsSource,
+#    *,
+#    components: tuple[str, ...] = ("text",),
+#    companions: Mapping[str, SafetensorsSource] | None = None,
+#    resource_overrides: Mapping[str, str | Path] | None = None,
+#) -> Model:
 def build_model(
     base: SafetensorsSource,
     *,
     components: tuple[str, ...] = ("text",),
     companions: Mapping[str, SafetensorsSource] | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
+    vocab_indices=None,
+    vocab_physical_rows: int | None = None,
 ) -> Model:
     selected = set(components)
     if "text" not in selected or selected - {
@@ -922,6 +933,62 @@ def build_model(
         raise ValueError("select text and supported optional components")
     companions = {} if companions is None else companions
     config = text_config(base.config, mtp="mtp" in selected)
+
+    original_vocab_size = config["vocab_size"]
+    logical_vocab_size = original_vocab_size
+    physical_vocab_indices = None
+
+    if vocab_indices is None:
+        if vocab_physical_rows is not None:
+            raise ValueError("vocab_physical_rows requires vocab_indices")
+    else:
+        if vocab_indices.ndim != 1:
+            raise ValueError("vocab_indices must be one-dimensional")
+        if vocab_indices.numel() <= 0:
+            raise ValueError("vocab_indices must not be empty")
+
+        if (
+            int(vocab_indices.min()) < 0
+            or int(vocab_indices.max()) >= original_vocab_size
+        ):
+            raise ValueError(
+                f"vocab indices outside original vocabulary "
+                f"0..{original_vocab_size - 1}"
+            )
+
+        logical_vocab_size = int(vocab_indices.numel())
+        physical_vocab_size = (
+            logical_vocab_size
+            if vocab_physical_rows is None
+            else int(vocab_physical_rows)
+        )
+
+        if physical_vocab_size < logical_vocab_size:
+            raise ValueError(
+                "physical vocabulary rows must be >= public vocabulary rows"
+            )
+        if physical_vocab_size > original_vocab_size:
+            raise ValueError(
+                "physical vocabulary rows must not exceed original vocabulary rows"
+            )
+
+        if physical_vocab_size == logical_vocab_size:
+            physical_vocab_indices = vocab_indices
+        else:
+            # Padding rows are deliberately outside the public token domain.
+            # Their numerical contents are therefore unobservable to correct
+            # sampling/argmax/top-k paths. Reuse one known-valid source row
+            # instead of inventing synthetic tensor storage.
+            physical_vocab_indices = vocab_indices.new_empty(
+                (physical_vocab_size,)
+            )
+            physical_vocab_indices[:logical_vocab_size].copy_(vocab_indices)
+            physical_vocab_indices[logical_vocab_size:].fill_(
+                int(vocab_indices[0])
+            )
+
+        config["vocab_size"] = physical_vocab_size
+
     records = {"text": {"config": config}}
     if "vision" in selected:
         records["vision"] = {
@@ -945,6 +1012,12 @@ def build_model(
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,
     )
+    if vocab_indices is not None and count != logical_vocab_size:
+        raise ValueError(
+            f"vocab map exposes {logical_vocab_size} public rows, "
+            f"but tokenizer exposes {count}"
+        )
+
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
     model = Model(
@@ -953,18 +1026,88 @@ def build_model(
     builder = _Builder(model)
     h, r = config["hidden_size"], config["vocab_size"]
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
-    builder.add(
-        "text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h)
-    )
-    head_source = (
-        text_prefix + "embed_tokens.weight"
+
+    embedding_source_name = text_prefix + "embed_tokens.weight"
+
+    head_source_name = (
+        embedding_source_name
         if config["tie_word_embeddings"]
         else "lm_head.weight"
     )
-    head_inputs = ("text/final_hidden",) + tuple(
-        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
-    )
-    builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
+
+    if vocab_indices is None:
+        builder.add(
+            "text/token_embedding",
+            base,
+            embedding_source_name,
+            (r, h),
+        )
+
+        head_inputs = ("text/final_hidden",) + tuple(
+            c + "/final_hidden"
+            for c in ("mtp", "dflash", "dflash2")
+            if c in selected
+        )
+
+        builder.add(
+            "text/output_head",
+            base,
+            head_source_name,
+            (r, h),
+            inputs=head_inputs,
+        )
+
+    else:
+        original_shape = (original_vocab_size, h)
+
+        embedding_source = matrix_source(
+            base,
+            embedding_source_name,
+            original_shape,
+            None,
+        )
+
+        output_source = matrix_source(
+            base,
+            head_source_name,
+            original_shape,
+            None,
+        )
+
+        embedding_source = gather_source(
+            embedding_source,
+            physical_vocab_indices,
+        )
+
+        output_source = gather_source(
+            output_source,
+            physical_vocab_indices,
+        )
+
+        model.add(
+            Parameter(
+                "text/token_embedding",
+                (r, h),
+                embedding_source,
+                residency="text",
+            )
+        )
+
+        head_inputs = ("text/final_hidden",) + tuple(
+            c + "/final_hidden"
+            for c in ("mtp", "dflash", "dflash2")
+            if c in selected
+        )
+
+        model.add(
+            Parameter(
+                "text/output_head",
+                (r, h),
+                output_source,
+                inputs=head_inputs,
+                residency="text",
+            )
+        )
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))
     for i, kind in enumerate(config["layer_types"]):
         builder.block(
