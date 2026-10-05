@@ -40,7 +40,9 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
         throw std::invalid_argument("linear_topk: unsupported head profile");
     }
     if ((head_rows == detail::kLinearTopKFullRows ||
-         head_rows == detail::kLinearTopKCompactRows) &&
+         head_rows == detail::kLinearTopKCompactRows ||
+         head_rows == detail::kLinearTopKScriptCutRows ||
+         head_rows == detail::kLinearTopKCombinedCutRows) &&
         qtype == QType::Q8_G32_FP16) {
         return HeadProfile::Q8Full;
     }
@@ -116,7 +118,9 @@ void require_q8(const Weight& head) {
         head.scale_dtype == DType::FP16 && head.group_size == 32 && head.group == 32 &&
         head.ndim == 2 &&
         (head.n == detail::kLinearTopKFullRows ||
-         head.n == detail::kLinearTopKCompactRows) &&
+         head.n == detail::kLinearTopKCompactRows ||
+         head.n == detail::kLinearTopKScriptCutRows ||
+         head.n == detail::kLinearTopKCombinedCutRows) &&
         head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
@@ -251,6 +255,10 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     const std::int32_t expected_valid_rows =
         profile == HeadProfile::Q8Full && head.n == detail::kLinearTopKCompactRows
             ? detail::kLinearTopKCompactValidRows
+        : profile == HeadProfile::Q8Full && head.n == detail::kLinearTopKScriptCutRows
+            ? detail::kLinearTopKScriptCutValidRows
+        : profile == HeadProfile::Q8Full && head.n == detail::kLinearTopKCombinedCutRows
+            ? detail::kLinearTopKCombinedCutValidRows
             : detail::kLinearTopKFullValidRows;
     if (profile == HeadProfile::Q4Optimized || valid_rows != expected_valid_rows) {
         throw std::invalid_argument("linear_topk: invalid full-head profile or valid_rows");

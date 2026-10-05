@@ -288,6 +288,14 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         return launch_tile_geometry<Q8LinearGeometry<180096, 5120>, Capacity>(
             hidden, head, valid_rows, workspace, stream);
     }
+    if (head.n == kLinearTopKScriptCutRows) {
+        return launch_tile_geometry<Q8LinearGeometry<211456, 5120>, Capacity>(
+            hidden, head, valid_rows, workspace, stream);
+    }
+    if (head.n == kLinearTopKCombinedCutRows) {
+        return launch_tile_geometry<Q8LinearGeometry<147712, 5120>, Capacity>(
+            hidden, head, valid_rows, workspace, stream);
+    }
     if (head.n == kLinearTopKFullRows) {
         return launch_tile_geometry<Q8LinearGeometry<248320, 5120>, Capacity>(
             hidden, head, valid_rows, workspace, stream);

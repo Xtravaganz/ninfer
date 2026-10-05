@@ -14,9 +14,13 @@ inline constexpr std::int32_t kLinearTopKDirectRows      = 16;
 inline constexpr std::int32_t kLinearTopKMergeFanIn      = 32;
 inline constexpr std::int32_t kLinearTopKFullRows         = 248320;
 inline constexpr std::int32_t kLinearTopKFullValidRows    = 248077;
-inline constexpr std::int32_t kLinearTopKCompactRows      = 180096;
-inline constexpr std::int32_t kLinearTopKCompactValidRows = 180000;
-inline constexpr std::int32_t kLinearTopKOptimizedRows    = 131072;
+inline constexpr std::int32_t kLinearTopKCompactRows          = 180096;
+inline constexpr std::int32_t kLinearTopKCompactValidRows     = 180000;
+inline constexpr std::int32_t kLinearTopKScriptCutRows        = 211456;
+inline constexpr std::int32_t kLinearTopKScriptCutValidRows   = 211375;
+inline constexpr std::int32_t kLinearTopKCombinedCutRows      = 147712;
+inline constexpr std::int32_t kLinearTopKCombinedCutValidRows = 147590;
+inline constexpr std::int32_t kLinearTopKOptimizedRows        = 131072;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
 
 struct LinearTopKWorkspace {
