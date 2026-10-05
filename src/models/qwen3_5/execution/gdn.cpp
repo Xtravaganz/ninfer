@@ -4,9 +4,33 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
+
+namespace {
+
+std::optional<float> target_igdn_dx_override() {
+    static const std::optional<float> value = []() -> std::optional<float> {
+        const char* raw = std::getenv("NINFER_TARGET_IGDN_DX_OVERRIDE");
+        if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+
+        char* end = nullptr;
+        const float parsed = std::strtof(raw, &end);
+
+        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0F) {
+            throw std::invalid_argument(
+                "NINFER_TARGET_IGDN_DX_OVERRIDE must be a finite positive float");
+        }
+        return parsed;
+    }();
+    return value;
+}
+
+} // namespace
 
 std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std::int32_t first,
                                            std::int32_t last) {
@@ -64,7 +88,16 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
         ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);
+        if (const auto dx = target_igdn_dx_override();
+            dx.has_value() && single.weight.qtype == QType::NVFP4) {
+            Weight runtime_weight = single.weight;
+            runtime_weight.input_scale_divisor = *dx;
+            ops::gdn_input_proj(
+                hidden, runtime_weight, qkv, z, single.policy, workspace, stream);
+        } else {
+            ops::gdn_input_proj(
+                hidden, single.weight, qkv, z, single.policy, workspace, stream);
+        }
     }
 }
 
@@ -97,9 +130,20 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
                                           destination_slots, query, key, value, z, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::gdn_input_proj_conv_snapshot(
-            hidden, single.weight, parameters.convolution, conv_states, valid_columns,
-            initial_slots, destination_slots, query, key, value, z, single.policy, scratch, stream);
+        if (const auto dx = target_igdn_dx_override();
+            dx.has_value() && single.weight.qtype == QType::NVFP4) {
+            Weight runtime_weight = single.weight;
+            runtime_weight.input_scale_divisor = *dx;
+            ops::gdn_input_proj_conv_snapshot(
+                hidden, runtime_weight, parameters.convolution, conv_states, valid_columns,
+                initial_slots, destination_slots, query, key, value, z, single.policy, scratch,
+                stream);
+        } else {
+            ops::gdn_input_proj_conv_snapshot(
+                hidden, single.weight, parameters.convolution, conv_states, valid_columns,
+                initial_slots, destination_slots, query, key, value, z, single.policy, scratch,
+                stream);
+        }
     }
 }
 
@@ -117,9 +161,18 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                                         query, key, value, z, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::gdn_input_proj_conv_record(hidden, single.weight, parameters.convolution, conv_states,
-                                        valid_columns, initial_slots, conv_record, query, key,
-                                        value, z, single.policy, scratch, stream);
+        if (const auto dx = target_igdn_dx_override();
+            dx.has_value() && single.weight.qtype == QType::NVFP4) {
+            Weight runtime_weight = single.weight;
+            runtime_weight.input_scale_divisor = *dx;
+            ops::gdn_input_proj_conv_record(
+                hidden, runtime_weight, parameters.convolution, conv_states, valid_columns,
+                initial_slots, conv_record, query, key, value, z, single.policy, scratch, stream);
+        } else {
+            ops::gdn_input_proj_conv_record(
+                hidden, single.weight, parameters.convolution, conv_states, valid_columns,
+                initial_slots, conv_record, query, key, value, z, single.policy, scratch, stream);
+        }
     }
 }
 

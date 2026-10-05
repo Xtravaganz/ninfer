@@ -42,8 +42,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -51,6 +53,38 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+std::optional<float> target_ogdn_dx_override() {
+    static const std::optional<float> value = []() -> std::optional<float> {
+        const char* raw = std::getenv("NINFER_TARGET_OGDN_DX_OVERRIDE");
+        if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+
+        char* end = nullptr;
+        const float parsed = std::strtof(raw, &end);
+        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0F) {
+            throw std::runtime_error(
+                "NINFER_TARGET_OGDN_DX_OVERRIDE must be a finite positive float");
+        }
+        return parsed;
+    }();
+    return value;
+}
+
+std::optional<float> target_oattn_dx_override() {
+    static const std::optional<float> value = []() -> std::optional<float> {
+        const char* raw = std::getenv("NINFER_TARGET_OATTN_DX_OVERRIDE");
+        if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+
+        char* end = nullptr;
+        const float parsed = std::strtof(raw, &end);
+        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0F) {
+            throw std::runtime_error(
+                "NINFER_TARGET_OATTN_DX_OVERRIDE must be a finite positive float");
+        }
+        return parsed;
+    }();
+    return value;
+}
 
 void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
              WorkspaceArena& workspace, cudaStream_t stream) {
@@ -921,8 +955,18 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor output_input = a.view({dimension(config_.attention->query_width()), T});
+    if (p.output.weight.qtype == QType::NVFP4) {
+        if (const auto dx = target_oattn_dx_override(); dx.has_value()) {
+            Weight runtime_weight = p.output.weight;
+            runtime_weight.input_scale_divisor = *dx;
+            ops::linear_add(output_input, runtime_weight, x, p.output.policy, work_, s);
+        } else {
+            ops::linear_add(output_input, p.output.weight, x, p.output.policy, work_, s);
+        }
+    } else {
+        ops::linear_add(output_input, p.output.weight, x, p.output.policy, work_, s);
+    }
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1057,8 +1101,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor output_input = on.view({dimension(config_.gdn->value_width()), T});
+    if (p.output.weight.qtype == QType::NVFP4) {
+        if (const auto dx = target_ogdn_dx_override(); dx.has_value()) {
+            Weight runtime_weight = p.output.weight;
+            runtime_weight.input_scale_divisor = *dx;
+            ops::linear_add(output_input, runtime_weight, x, p.output.policy, work_, s);
+        } else {
+            ops::linear_add(output_input, p.output.weight, x, p.output.policy, work_, s);
+        }
+    } else {
+        ops::linear_add(output_input, p.output.weight, x, p.output.policy, work_, s);
+    }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {

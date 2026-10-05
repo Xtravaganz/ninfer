@@ -3,10 +3,32 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/rope.h"
 
+#include <cmath>
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+std::optional<float> target_iattn_dx_override() {
+    static const std::optional<float> value = []() -> std::optional<float> {
+        const char* raw = std::getenv("NINFER_TARGET_IATTN_DX_OVERRIDE");
+        if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+
+        char* end = nullptr;
+        const float parsed = std::strtof(raw, &end);
+
+        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0F) {
+            throw std::runtime_error(
+                "NINFER_TARGET_IATTN_DX_OVERRIDE must be a finite positive float");
+        }
+
+        return parsed;
+    }();
+
+    return value;
+}
 
 void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
     if (positions.ne[1] != 3) { return; }
@@ -39,8 +61,24 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
         ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,
-                             workspace, stream);
+
+        if (single.weight.qtype == QType::NVFP4) {
+            if (const auto dx = target_iattn_dx_override(); dx.has_value()) {
+                Weight runtime_weight = single.weight;
+                runtime_weight.input_scale_divisor = *dx;
+                ops::attn_input_proj(
+                    hidden, runtime_weight, query, gate, key, value,
+                    single.policy, workspace, stream);
+            } else {
+                ops::attn_input_proj(
+                    hidden, single.weight, query, gate, key, value,
+                    single.policy, workspace, stream);
+            }
+        } else {
+            ops::attn_input_proj(
+                hidden, single.weight, query, gate, key, value,
+                single.policy, workspace, stream);
+        }
     }
 }
 
