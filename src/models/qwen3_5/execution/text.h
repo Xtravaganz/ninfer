@@ -65,6 +65,8 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+struct MtpIndexedShadow;
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -84,6 +86,10 @@ public:
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
+    }
+
+    void set_indexed_shadow(MtpIndexedShadow* shadow) noexcept {
+        indexed_shadow_ = shadow;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -248,6 +254,7 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    MtpIndexedShadow* indexed_shadow_          = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

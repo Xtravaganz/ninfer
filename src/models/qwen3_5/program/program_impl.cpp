@@ -1,4 +1,10 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include <array>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <vector>
+
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -300,6 +306,111 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     }
+
+    // EXPERIMENT ONLY: allocated before graph preparation and never used
+    // unless the isolated test explicitly opts in.
+    if (const char* shadow_env = std::getenv("NINFER_MTP_INDEXED_SHADOW");
+        shadow_env != nullptr && shadow_env[0] != '\0') {
+        if (std::string(shadow_env) != "1") {
+            throw std::invalid_argument(
+                "NINFER_MTP_INDEXED_SHADOW must equal 1 when specified");
+        }
+        if (speculative_backend != SpeculativeBackend::Mtp ||
+            proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument(
+                "Indexed MTP experiment requires MTP and full proposal head");
+        }
+        const char* requested_mode = std::getenv("NINFER_MTP_INDEXED_MODE");
+        const std::string selected_mode =
+            requested_mode ? std::string(requested_mode) : "shadow";
+        if (use_cuda_graph && selected_mode != "indexed96") {
+            throw std::invalid_argument(
+                "CUDA Graphs are supported only in indexed96 direct mode");
+        }
+
+        auto selected = std::make_unique<execution::MtpIndexedShadow>();
+        constexpr auto base =
+            "/opt/ninfer/rankings/thinkingcap-v1-v5/";
+
+        const auto load_ids = [&](const char* name, std::int32_t count,
+                                  DeviceBuffer& destination) {
+            std::ifstream in(std::string(base) + name, std::ios::binary | std::ios::ate);
+            if (!in) {
+                throw std::runtime_error("Indexed MTP ranking file not found");
+            }
+            const auto expected =
+                static_cast<std::streamoff>(count) * sizeof(std::int32_t);
+            if (in.tellg() != expected) {
+                throw std::runtime_error("Indexed MTP ranking file size mismatch");
+            }
+            in.seekg(0);
+            std::vector<std::int32_t> ids(static_cast<std::size_t>(count));
+            in.read(reinterpret_cast<char*>(ids.data()), expected);
+            if (!in) {
+                throw std::runtime_error("Indexed MTP ranking read failed");
+            }
+            std::int32_t previous = -1;
+            for (const auto id : ids) {
+                if (id <= previous ||
+                    id >= execution::MtpIndexedShadow::kPublicRows) {
+                    throw std::runtime_error(
+                        "Indexed MTP ranking IDs invalid or unsorted");
+                }
+                previous = id;
+            }
+            destination = DeviceBuffer(static_cast<std::size_t>(expected));
+            destination.copy_from_host(ids.data(), static_cast<std::size_t>(expected));
+        };
+
+        load_ids("selected_98304_physical_sorted.i32le",
+                 execution::MtpIndexedShadow::kLargeRows, selected->ids96);
+
+        // Bounded experimental proposal width. No allocations in proposal_argmax.
+        constexpr std::int32_t kShadowCapacity = 16;
+        selected->token_capacity = kShadowCapacity;
+        selected->logits96 = DeviceBuffer(
+            static_cast<std::size_t>(selected->kLargeRows) * kShadowCapacity * 2);
+        selected->proposals96 = DeviceBuffer(
+            static_cast<std::size_t>(kShadowCapacity) * sizeof(std::int32_t));
+        selected->reference_proposals = DeviceBuffer(
+            static_cast<std::size_t>(kShadowCapacity) * sizeof(std::int32_t));
+
+        selected->counters = DeviceBuffer(4 * sizeof(std::uint64_t));
+        selected->missing_ids = DeviceBuffer(
+            static_cast<std::size_t>(
+                execution::MtpIndexedShadow::kMissingCapacity) *
+            sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemsetAsync(
+            selected->counters.p, 0, selected->counters.bytes, device.stream));
+
+        // EXPERIMENT ONLY: enabled exclusively after the explicit
+        // environment, model, eager-mode and allocation checks above.
+        if (!selected->ids96.p || !selected->logits96.p ||
+            !selected->proposals96.p ||
+            !selected->counters.p || !selected->missing_ids.p ||
+            selected->token_capacity < 8) {
+            throw std::runtime_error(
+                "Indexed MTP shadow initialization incomplete");
+        }
+        // Only experimental Eager-MTP instances reach this point.
+        const char* mode_env = std::getenv("NINFER_MTP_INDEXED_MODE");
+        const std::string mode =
+            mode_env ? std::string(mode_env) : "shadow";
+
+        if (mode == "shadow") {
+            selected->mode = execution::MtpIndexedMode::Shadow;
+        } else if (mode == "indexed96") {
+            selected->mode = execution::MtpIndexedMode::Indexed96;
+        } else {
+            throw std::invalid_argument(
+                "NINFER_MTP_INDEXED_MODE must be "
+                "shadow or indexed96");
+        }
+
+        selected->enabled = true;
+        indexed_shadow = std::move(selected);
+    }
+
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);

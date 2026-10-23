@@ -85,6 +85,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
+        // EXPERIMENT ONLY: pass the shadow state to the Eager MTP decoder.
+        // Full-Q8 proposals remain authoritative.
+        card.set_indexed_shadow(state.execution.indexed_shadow);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);

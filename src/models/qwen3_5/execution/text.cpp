@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/execution/mtp_indexed_shadow_launch.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
@@ -617,10 +618,35 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                           ctx_.stream);
         }
     } else {
+        // EXPERIMENT ONLY: direct Indexed-Q8 computes exactly one selected
+        // projection. All ordinary/full-head behavior remains unchanged.
+        if (indexed_shadow_ != nullptr && indexed_shadow_->enabled &&
+            indexed_shadow_->mode != MtpIndexedMode::Shadow) {
+            if (T <= 0 || T > 8 || T > indexed_shadow_->token_capacity) {
+                throw std::invalid_argument(
+                    "Indexed MTP direct proposal width exceeds supported capacity");
+            }
+            mtp_indexed_direct_launch(
+                hidden, mtp_->output_head.weight, proposal_tokens,
+                *indexed_shadow_, ctx_.stream);
+            return;
+        }
+
         Tensor output_logits = matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+
+        if (indexed_shadow_ != nullptr && indexed_shadow_->enabled &&
+            indexed_shadow_->mode == MtpIndexedMode::Shadow) {
+            if (T <= 0 || T > 8 || T > indexed_shadow_->token_capacity) {
+                throw std::invalid_argument(
+                    "Indexed MTP shadow proposal width exceeds supported capacity");
+            }
+            mtp_indexed_shadow_launch(
+                hidden, mtp_->output_head.weight, proposal_tokens,
+                *indexed_shadow_, ctx_.stream);
+        }
     }
 }
 

@@ -28,6 +28,8 @@ using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
 using qwen3_5::PromptModality;
 
+struct MtpIndexedShadow;
+
 struct ExecutionCore {
     DeviceContext& device;
     const execution::Parameters& parameters;
@@ -38,6 +40,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    MtpIndexedShadow* indexed_shadow = nullptr;
 };
 
 struct PrefillContext {

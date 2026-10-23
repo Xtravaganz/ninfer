@@ -1,5 +1,7 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/mtp_frequency.h"
+#include "models/qwen3_5/execution/mtp_indexed_shadow.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -601,6 +603,9 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+
+    MtpFrequencyCollector mtp_frequency;
+    std::unique_ptr<execution::MtpIndexedShadow> indexed_shadow;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;

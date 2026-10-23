@@ -1,3 +1,4 @@
+#include <iostream>
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -493,7 +494,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   indexed_shadow.get()},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -510,6 +512,58 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
+        }
+        // EXPERIMENT ONLY: read counters after the existing MTP GPU wait.
+        // Full-Q8 continues to control all actual decoder proposals.
+        if (indexed_shadow && indexed_shadow->enabled &&
+            indexed_shadow->mode == execution::MtpIndexedMode::Shadow) {
+            std::uint64_t counts[4]{};
+            indexed_shadow->counters.copy_to_host(
+                counts, sizeof(counts));
+
+            std::cerr
+                << "[MTP_INDEXED_SHADOW]"
+                << " total=" << counts[0]
+                << " present96=" << counts[1]
+                << " match96=" << counts[2]
+                << " missing=" << counts[3]
+                << '\n';
+
+            if (counts[3] != counts[0] - counts[1]) {
+                throw std::runtime_error(
+                    "Indexed-96K missing counter invariant failed");
+            }
+
+            if (counts[3] > indexed_shadow->reported_missing) {
+                constexpr auto capacity =
+                    execution::MtpIndexedShadow::kMissingCapacity;
+
+                std::int32_t captured[capacity]{};
+                indexed_shadow->missing_ids.copy_to_host(
+                    captured, sizeof(captured));
+
+                const auto begin = indexed_shadow->reported_missing;
+                const auto end = counts[3] < capacity
+                    ? counts[3] : static_cast<std::uint64_t>(capacity);
+
+                for (auto i = begin; i < end; ++i) {
+                    std::cerr
+                        << "[MTP_INDEXED_MISSING]"
+                        << " ordinal=" << i
+                        << " token_id=" << captured[i]
+                        << '\n';
+                }
+
+                if (begin < capacity && counts[3] > capacity) {
+                    std::cerr
+                        << "[MTP_INDEXED_MISSING]"
+                        << " OVERFLOW capacity=" << capacity
+                        << " total_missing=" << counts[3]
+                        << '\n';
+                }
+
+                indexed_shadow->reported_missing = counts[3];
+            }
         }
         timing.end_wait();
 
@@ -546,6 +600,16 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            // Host buffers are already synchronized above. Count only the drafts
+            // actually submitted for verification (never the padded ingress slots).
+            // No GPU copy, decoding, or file I/O occurs in this hot path.
+            if (pcur != 0 && mtp_frequency.enabled()) {
+                const auto* draft_ids = &mtp_host_ingress->current_drafts[row * draft_window];
+                mtp_frequency.record(
+                    std::span<const std::int32_t>(draft_ids, pcur),
+                    static_cast<std::size_t>(accepted_i),
+                    std::span<const std::int32_t>(row_tokens.data(), row_tokens.size()));
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,

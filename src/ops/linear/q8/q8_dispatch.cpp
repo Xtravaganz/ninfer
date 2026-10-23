@@ -31,6 +31,7 @@ constexpr std::array kShapes{
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N34816K5120>(select_q8_n34816_k5120),
     shape<Q8N180096K5120>(select_q8_n180096_k5120),
     shape<Q8N147712K5120>(select_q8_n147712_k5120),
+    shape<Q8N148480K5120>(select_q8_n148480_k5120),
     shape<Q8N211456K5120>(select_q8_n211456_k5120),
     shape<Q8N248320K5120>(select_q8_n248320_k5120),
 };
