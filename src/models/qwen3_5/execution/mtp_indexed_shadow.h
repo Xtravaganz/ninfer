@@ -18,10 +18,10 @@ enum class MtpIndexedMode {
 };
 
 struct MtpIndexedShadow final {
-    static constexpr std::int32_t kPhysicalRows = 147712;
-    static constexpr std::int32_t kPublicRows = 147590;
+    static constexpr std::int32_t kPhysicalRows = 135168;
+    static constexpr std::int32_t kPublicRows = 135000;
     static constexpr std::int32_t kHidden = 5120;
-    static constexpr std::int32_t kLargeRows = 98304;
+    static constexpr std::int32_t kLargeRows = 88064;
 
     // Persistent device-owned selection arrays.
     DeviceBuffer ids96;

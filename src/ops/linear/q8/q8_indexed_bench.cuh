@@ -35,8 +35,8 @@ void launch_q8_indexed_bench(const Q8LinearOperands& full,
                              __nv_bfloat16* output,
                              cudaStream_t stream) {
     validate_q8_operands(full);
-    if (full.rows != 147712 || full.k != 5120 || full.padded_k != 5120) {
-        throw std::invalid_argument("indexed Q8 benchmark requires physical 147712 x 5120");
+    if (full.rows != 135168 || full.k != 5120 || full.padded_k != 5120) {
+        throw std::invalid_argument("indexed Q8 benchmark requires physical 135168 x 5120");
     }
     if (!device_row_ids || !output || selected_count <= 0 ||
         selected_count > full.rows || selected_count % 16 != 0 ||

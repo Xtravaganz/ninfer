@@ -1,5 +1,17 @@
 # NInfer
 
+<!-- thinkingcap-indexed88-v6.4-135k-r2 -->
+## ThinkingCap Qwen3.8-27B — 135K Indexed88 runtime
+
+This repository also provides a version-pinned **single-head, Indexed88 Q8 MTP5 runtime** for
+[Schestex/ThinkingCap-Qwen3.8-27B-NInfer](https://huggingface.co/Schestex/ThinkingCap-Qwen3.8-27B-NInfer).
+It uses 135,000 public vocabulary tokens, 135,168 padded physical output rows,
+and an 88,064-row selected MTP proposal projection. See the
+[Indexed88 v6.4 R2 release guide](docs/releases/thinkingcap-indexed88-v6.4-135k-r2.md)
+for compatible artifacts, build instructions, exact runtime flags and benchmark limitations.
+
+This variant is version-pinned separately from NInfer's general-purpose `master` branch.
+
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a

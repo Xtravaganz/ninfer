@@ -329,12 +329,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
 
         auto selected = std::make_unique<execution::MtpIndexedShadow>();
-        constexpr auto base =
-            "/opt/ninfer/rankings/thinkingcap-v1-v5/";
+        const char* ranking_env = std::getenv("NINFER_MTP_INDEXED_RANKING");
+        if (!ranking_env || ranking_env[0] != '/') {
+            throw std::invalid_argument(
+                "135K Indexed88 requires absolute NINFER_MTP_INDEXED_RANKING");
+        }
 
         const auto load_ids = [&](const char* name, std::int32_t count,
                                   DeviceBuffer& destination) {
-            std::ifstream in(std::string(base) + name, std::ios::binary | std::ios::ate);
+            (void)name;
+            std::ifstream in(ranking_env, std::ios::binary | std::ios::ate);
             if (!in) {
                 throw std::runtime_error("Indexed MTP ranking file not found");
             }
@@ -362,7 +366,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             destination.copy_from_host(ids.data(), static_cast<std::size_t>(expected));
         };
 
-        load_ids("selected_98304_physical_sorted.i32le",
+        load_ids("selected_88064_physical_sorted.i32le",
                  execution::MtpIndexedShadow::kLargeRows, selected->ids96);
 
         // Bounded experimental proposal width. No allocations in proposal_argmax.

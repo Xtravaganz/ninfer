@@ -117,7 +117,7 @@ void mtp_indexed_shadow_launch(
     if (physical_q8_head.n != MtpIndexedShadow::kPhysicalRows ||
         physical_q8_head.k != MtpIndexedShadow::kHidden) {
         throw std::invalid_argument(
-            "Indexed MTP shadow requires physical Q8 147712x5120");
+            "Indexed MTP shadow requires physical Q8 135168x5120");
     }
     if (!shadow.ids96.p || !shadow.logits96.p ||
         !shadow.proposals96.p || !shadow.counters.p ||
@@ -161,7 +161,7 @@ void mtp_indexed_direct_launch(
         physical_q8_head.k != MtpIndexedShadow::kHidden ||
         physical_q8_head.padded_shape[1] != MtpIndexedShadow::kHidden)
         throw std::invalid_argument(
-            "Indexed MTP direct requires Q8 147712x5120");
+            "Indexed MTP direct requires Q8 135168x5120");
 
     if (decoder_proposal_tokens.dtype != DType::I32 ||
         decoder_proposal_tokens.ne[0] != tokens ||
