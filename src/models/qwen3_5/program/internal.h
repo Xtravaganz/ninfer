@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/observability/gpu_timing.h"
+#include "core/buffer.h"
 
 #include "ninfer/ops/kv_cache_append.h"
 
@@ -154,6 +155,8 @@ public:
     const KvCacheStorage kv_storage;
     const WorkspaceSpec workspace_plan;
     Resources resources;
+    // 88,064 ascending I32 IDs on device; empty unless explicit opt-in.
+    DeviceBuffer indexed88_ids;
     std::unique_ptr<context::ContextStorage> storage;
     std::unique_ptr<context::ContextMigration> compute_actions;
     std::unique_ptr<context::ContextMigration> context_actions;

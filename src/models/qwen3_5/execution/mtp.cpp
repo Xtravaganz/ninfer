@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/indexed88_q8.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/linear_pair.h"
@@ -282,6 +283,22 @@ void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logi
     case ProposalHead::Full:
         require_tensor(full_logits, DType::BF16, {dimension(config.vocab_size), columns},
                        state.execution.device(), "proposal logits");
+        if (state.indexed88_ids) {
+            // Reinterpret the already allocated full-head logits storage as a compact
+            // contiguous [88064,C] scratch view. No new 88K logits allocation, and
+            // neither a second Q8 weight matrix nor a second full-head projection.
+            if (config.vocab_size != 135168 || state.parameters.profile->public_tokens != 135000) {
+                throw std::invalid_argument("Indexed88: expected 135K public/physical vocabulary");
+            }
+            if (columns > 8) {
+                throw std::invalid_argument("Indexed88: MTP proposal width exceeds 8");
+            }
+            Tensor compact_logits({full_logits.data, full_logits.bytes(), full_logits.device},
+                                  DType::BF16, {ops::kThinkingCapIndexed88Rows, columns});
+            ops::indexed88_q8_propose(hidden, parameters.output_head.weight,
+                                      state.indexed88_ids, compact_logits, ids, state.execution);
+            return;
+        }
         ops::linear(hidden, parameters.output_head.weight, full_logits,
                     parameters.output_head.policy, state.workspace, state.execution);
         ops::argmax(full_logits, ids, dimension(state.parameters.profile->public_tokens),

@@ -25,6 +25,8 @@ struct MtpExecutionView {
     CudaExecutionView execution;
     PagedKVBatchLayerView cache;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Null unless the ThinkingCap 135K Indexed88 direct path is enabled.
+    const std::int32_t* indexed88_ids = nullptr;
 };
 
 // Each live column pairs target conditioning H[p] with token x[p+1], writes cache position p,

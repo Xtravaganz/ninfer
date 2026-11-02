@@ -256,3 +256,11 @@ source with [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/
 weights. GLM's source weights use [MIT](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/LICENSE).
 Model licenses are separate from NInfer's software license. Vendored dependencies retain their own
 license files under `third_party/`.
+
+## ThinkingCap 135K Indexed88 v7.0 (Blackwell)
+
+A specialized Q8 Indexed88 MTP5 integration for the newer NInfer upstream
+runtime is available in [the v7.0 release notes](docs/releases/thinkingcap-indexed88-v7.0-135k.md).
+The 88,064-ID ranking is shipped under `assets/indexed88/`. This public release
+excludes internal vocabulary-coverage and full-head-probe instrumentation.
+The older `thinkingcap-indexed88-v6.4-135k-r2` tag remains available.
