@@ -76,11 +76,19 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
         }
         switch (models::resolve_architecture(reader->directory())) {
         case models::Architecture::Qwen4Exp:
+#if NINFER_HAVE_MODEL_QWEN4_EXP
             run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), request);
             break;
+#else
+            throw std::logic_error("qwen4_exp model not compiled into this build");
+#endif
         case models::Architecture::Glm5Next:
+#if NINFER_HAVE_MODEL_GLM5NEXT
             run_rank<models::glm5next::RankPreparation>(connection, std::move(reader), request);
             break;
+#else
+            throw std::logic_error("glm5next model not compiled into this build");
+#endif
         default:
             throw std::invalid_argument("architecture has no distributed worker implementation");
         }

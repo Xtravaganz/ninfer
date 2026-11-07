@@ -46,6 +46,32 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
 
+# Model families to compile. "all" keeps every family. A semicolon list omits the
+# other families (their frontend/execution/session sources and model libs), shrinking
+# the image. qwen3_5 is the anchor family and is always compiled; qwen4_exp and
+# glm5next are optional and only built when named (or via "all").
+set(NINFER_MODEL_FAMILIES "all" CACHE STRING "Model families to build (all; or a ;-list of qwen3_5;qwen4_exp;glm5next)")
+set_property(CACHE NINFER_MODEL_FAMILIES PROPERTY STRINGS all qwen3_5 qwen4_exp glm5next)
+
+set(NINFER_BUILD_MODEL_QWEN3_5 1)
+set(NINFER_BUILD_MODEL_QWEN4_EXP 0)
+set(NINFER_BUILD_MODEL_GLM5NEXT 0)
+if(NINFER_MODEL_FAMILIES STREQUAL "all")
+  set(NINFER_BUILD_MODEL_QWEN4_EXP 1)
+  set(NINFER_BUILD_MODEL_GLM5NEXT 1)
+else()
+  foreach(family IN LISTS NINFER_MODEL_FAMILIES)
+    if(family STREQUAL "qwen4_exp")
+      set(NINFER_BUILD_MODEL_QWEN4_EXP 1)
+    elseif(family STREQUAL "glm5next")
+      set(NINFER_BUILD_MODEL_GLM5NEXT 1)
+    elseif(NOT family STREQUAL "qwen3_5")
+      message(WARNING "NINFER_MODEL_FAMILIES: unknown family '${family}'")
+    endif()
+  endforeach()
+endif()
+message(STATUS "NInfer model families: qwen3_5=on qwen4_exp=${NINFER_BUILD_MODEL_QWEN4_EXP} glm5next=${NINFER_BUILD_MODEL_GLM5NEXT}")
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

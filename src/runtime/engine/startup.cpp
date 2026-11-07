@@ -87,6 +87,7 @@ ConstructedModel construct_model(EngineOptions& options) {
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
     case models::Architecture::Glm5Next: {
+#if NINFER_HAVE_MODEL_GLM5NEXT
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {
             auto built = detail::build_distributed_model<models::glm5next::ParallelStartup>(
@@ -98,8 +99,12 @@ ConstructedModel construct_model(EngineOptions& options) {
         auto built =
             detail::build_prepared_local_model<models::glm5next::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
+#else
+        throw std::logic_error("glm5next model not compiled into this build");
+#endif
     }
     case models::Architecture::Qwen4Exp: {
+#if NINFER_HAVE_MODEL_QWEN4_EXP
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {
             auto built = detail::build_distributed_model<models::qwen4_exp::ParallelStartup>(
@@ -110,6 +115,9 @@ ConstructedModel construct_model(EngineOptions& options) {
 #endif
         auto built = detail::build_local_model<models::qwen4_exp::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
+#else
+        throw std::logic_error("qwen4_exp model not compiled into this build");
+#endif
     }
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {

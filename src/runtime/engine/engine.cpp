@@ -174,14 +174,27 @@ public:
     using Qwen35         = runtime::InferenceInstance<models::qwen3_5::RuntimeTypes>;
     using GenerationCore = runtime::EngineCore<Qwen35>;
     using ScoringCore    = runtime::CausalScoreCore<Qwen35>;
+#if NINFER_HAVE_MODEL_QWEN4_EXP
     using Qwen4          = runtime::InferenceInstance<models::qwen4_exp::RuntimeTypes>;
+#endif
+#if NINFER_HAVE_MODEL_GLM5NEXT
     using Glm            = runtime::InferenceInstance<models::glm5next::RuntimeTypes>;
+#endif
+    // monostate first (always); optional families in the middle; qwen3_5 cores last as the
+    // anchor (leading commas on the anchor lines are always present, so the variant stays
+    // well-formed when a family is compiled out).
     using Core =
-        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                     std::unique_ptr<runtime::EngineCore<Qwen4>>,
-                     std::unique_ptr<runtime::CausalScoreCore<Qwen4>>,
-                     std::unique_ptr<runtime::EngineCore<Glm>>,
-                     std::unique_ptr<runtime::CausalScoreCore<Glm>>>;
+        std::variant<std::monostate
+#if NINFER_HAVE_MODEL_QWEN4_EXP
+            , std::unique_ptr<runtime::EngineCore<Qwen4>>
+            , std::unique_ptr<runtime::CausalScoreCore<Qwen4>>
+#endif
+#if NINFER_HAVE_MODEL_GLM5NEXT
+            , std::unique_ptr<runtime::EngineCore<Glm>>
+            , std::unique_ptr<runtime::CausalScoreCore<Glm>>
+#endif
+            , std::unique_ptr<GenerationCore>
+            , std::unique_ptr<ScoringCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))) {
