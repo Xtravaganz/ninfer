@@ -20,7 +20,17 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 21;
+// Schema version 22 adds request-owned materialization planning detail on top of v21: the
+// granular economic refusal behind an `InsufficientExpectedGain` stop
+// (`search_budget_refusal`) and the per-target `logical_goal_available` flag that gates whether
+// a feasible target can be the planner-preferred (`best_assessed_target`) target.
+// Schema version 23 removes the four unreachable discovery rejection counters
+// (`rejected_{private,shared}_{not_catalogued,handle_missing}`); `valid_prefix_index_entry()`
+// already folds those states into `rejected_invalid_prefix_index_entry`.
+// Schema version 24 adds `search_budget_decision`, the numeric values of the last search-budget
+// renewal attempt behind `search_budget_refusal` (elapsed/granted/remaining allowance,
+// operation/completion/gain/economic-gain-budget estimates, and the prediction/progress flags).
+inline constexpr int kRequestLogSchemaVersion        = 24;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

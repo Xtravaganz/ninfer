@@ -123,6 +123,10 @@ public:
         std::vector<IdentityRoot> roots;
         roots.reserve(candidates.size());
         std::uint64_t projection_work = 0;
+        std::vector<MaterializationCandidateTrace> candidate_traces;
+        candidate_traces.reserve(candidates.size());
+        std::vector<std::optional<FoldedCost>> candidate_best_cost;
+        candidate_best_cost.reserve(candidates.size());
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             const CandidateInput& input = candidates[index];
             const IdentityMaterializationAssessment& identity =
@@ -157,6 +161,10 @@ public:
                 .lower_bound_ns  = cost.lower_bound_ns,
                 .expandable      = needs_pressure || pressure_can_improve,
             });
+            candidate_traces.push_back(
+                identity_candidate_trace(input, identity, cost, goal.has_value(),
+                                         candidate_seeded[index]));
+            candidate_best_cost.push_back(std::nullopt);
         }
 
         if (identity_best) {
@@ -189,6 +197,11 @@ public:
                     needs_optional_search ? MaterializationStopReason::TimeBudget
                                           : MaterializationStopReason::NoPressure,
                     false);
+                const MaterializationIncumbentTrace identity_trace =
+                    incumbent_trace(*identity_best, selected);
+                diagnostics.initial_incumbent  = identity_trace;
+                diagnostics.selected_incumbent = identity_trace;
+                diagnostics.candidates = std::move(candidate_traces);
                 diagnostics.budget_exhausted  = needs_optional_search;
                 diagnostics.search_stop_phase = needs_optional_search
                                                     ? MaterializationSearchPhase::Setup
@@ -232,6 +245,34 @@ public:
             return static_cast<std::uint32_t>(found - candidates.begin());
         };
 
+        // Aggregate one assessed pressure target into the per-candidate trace. Discovered and
+        // assessed counts are keyed to the target's own ordinal so repeated marks and the pending
+        // assessment of an already-seen child do not double count. `targets_discovered` covers
+        // pressure search only; the identity target is described by `identity_target_ordinal` and
+        // `candidate_seeded`. The planner-preferred target must be selectable: a physically
+        // feasible target without a logical goal can never become the incumbent, so it is counted
+        // in `feasible_targets` but is not recorded as `best_assessed_target`.
+        const auto record_assessment = [&](std::uint32_t candidate_index,
+                                           const PressureTargetAssessment& assessment,
+                                           const FoldedCost& cost,
+                                           bool logical_goal_available) {
+            MaterializationCandidateTrace& trace = candidate_traces[candidate_index];
+            if (!target_marked(cost.target_ordinal, kTargetDiscovered)) {
+                ++trace.targets_discovered;
+            }
+            mark_target(cost.target_ordinal, kTargetDiscovered | kTargetAssessed);
+            ++trace.targets_assessed;
+            if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) { return; }
+            ++trace.feasible_targets;
+            if (!logical_goal_available) { return; }
+            std::optional<FoldedCost>& best = candidate_best_cost[candidate_index];
+            if (!best || cost.less(*best)) {
+                best = cost;
+                trace.best_assessed_target =
+                    target_trace(cost, assessment, /*logical_goal_available=*/true);
+            }
+        };
+
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
         if (identity_best) {
@@ -256,9 +297,10 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
+            // Read the assessment before make_incumbent moves it into the incumbent.
+            record_assessment(root_candidate_index, assessment, cost, goal.has_value());
             incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
                                        std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
         if (!identity_best) { search_started = Clock::now(); }
@@ -302,6 +344,8 @@ public:
             estimate          = std::max<std::uint64_t>(1, estimate / 2 + sample / 2);
         };
 
+        const MaterializationIncumbentTrace initial_incumbent =
+            incumbent_trace(incumbent, candidates[incumbent.candidate_index]);
 
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
@@ -353,7 +397,6 @@ public:
                 assessment.stable_target_ordinal != expected_ordinal) {
                 throw std::logic_error("pressure target changed admission candidate");
             }
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
@@ -364,6 +407,7 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            record_assessment(expected_candidate, assessment, cost, goal.has_value());
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
@@ -406,6 +450,7 @@ public:
                 const std::uint32_t candidate_index = candidate_index_for(guidance.candidate);
                 if (target_marked(guidance.stable_target_ordinal, kTargetDiscovered)) { continue; }
                 mark_target(guidance.stable_target_ordinal, kTargetDiscovered);
+                ++candidate_traces[candidate_index].targets_discovered;
                 const std::uint64_t lower_bound_ns = std::max(
                     identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
                 GuidanceCost cost =
@@ -584,6 +629,7 @@ public:
                     path.visited.push_back(chosen.stable_target_ordinal);
                     if (!target_marked(chosen.stable_target_ordinal, kTargetDiscovered)) {
                         mark_target(chosen.stable_target_ordinal, kTargetDiscovered);
+                        ++candidate_traces[path.candidate_index].targets_discovered;
                         ++optional_targets;
                         pending_push({.target          = *target,
                                       .candidate_index = path.candidate_index,
@@ -724,6 +770,12 @@ public:
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+        diagnostics.initial_incumbent  = initial_incumbent;
+        diagnostics.selected_incumbent = incumbent_trace(incumbent, selected);
+        for (std::size_t index = 0; index < candidate_traces.size(); ++index) {
+            candidate_traces[index].candidate_seeded = candidate_seeded[index];
+        }
+        diagnostics.candidates = std::move(candidate_traces);
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -734,6 +786,8 @@ public:
         diagnostics.search_discovery_used      = search_budget.discovery_used();
         diagnostics.search_stop_phase          = search_phase;
         diagnostics.search_boundary_limited    = search_budget.boundary_limited();
+        diagnostics.search_budget_refusal      = search_budget.refusal_reason();
+        diagnostics.search_budget_decision     = search_budget.decision_trace();
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
@@ -1324,6 +1378,106 @@ private:
             .selected_degradation_units = degradation_units,
             .selected_maximal_fallback  = maximal_fallback,
             .initial_predicted_total_ns = cost.total_ns,
+        };
+    }
+
+    // Public mirrors of the runtime/contract projection and source-mode enums. serve/ only sees the
+    // public API, so the request log needs value mappings that do not depend on runtime/contract.
+    [[nodiscard]] static MaterializationProjectionStatus
+    public_projection_status(MaterializationPhysicalStatus status) noexcept {
+        switch (status) {
+        case MaterializationPhysicalStatus::Feasible:
+            return MaterializationProjectionStatus::Feasible;
+        case MaterializationPhysicalStatus::StructuralInvalid:
+            return MaterializationProjectionStatus::StructuralInvalid;
+        case MaterializationPhysicalStatus::Infeasible:
+            return MaterializationProjectionStatus::Infeasible;
+        }
+        return MaterializationProjectionStatus::Infeasible;
+    }
+
+    [[nodiscard]] static MaterializationSourceMode
+    public_source_mode(PrivateSourceMode mode) noexcept {
+        switch (mode) {
+        case PrivateSourceMode::Retain:
+            return MaterializationSourceMode::Retain;
+        case PrivateSourceMode::ConsumeToActive:
+            return MaterializationSourceMode::ConsumeToActive;
+        }
+        return MaterializationSourceMode::ConsumeToActive;
+    }
+
+    [[nodiscard]] static MaterializationIncumbentTrace
+    incumbent_trace(const Incumbent& incumbent, const CandidateInput& candidate) noexcept {
+        return MaterializationIncumbentTrace{
+            .candidate_id             = incumbent.candidate_index,
+            .target_ordinal           = incumbent.cost.target_ordinal,
+            .reuse_path               = candidate.candidate->summary().prefix_reuse_path,
+            .root_maximal             = incumbent.root_maximal,
+            .degradation_units        = incumbent.degradation_units,
+            .reused_prompt_tokens     =
+                static_cast<std::uint32_t>(incumbent.cost.reused_prompt_tokens),
+            .predicted_now_ns         = incumbent.cost.now_ns,
+            .predicted_future_loss_ns = incumbent.cost.future_loss_ns,
+            .predicted_total_ns       = incumbent.cost.total_ns,
+        };
+    }
+
+    // Identity-level view of one admission candidate, captured while the candidate's basic
+    // projection is folded. Pressure-search counters and best target are added later.
+    [[nodiscard]] static MaterializationCandidateTrace
+    identity_candidate_trace(const CandidateInput& input,
+                             const IdentityMaterializationAssessment& identity,
+                             const FoldedCost& cost, bool logical_goal, bool seeded) noexcept {
+        return MaterializationCandidateTrace{
+            .candidate_id            = input.id.value,
+            .identity_target_ordinal = cost.target_ordinal,
+            .reuse_path              = input.candidate->summary().prefix_reuse_path,
+            .current_session_binding = input.current_session_binding,
+            .physical_status         = public_projection_status(identity.physical_status),
+            .source_mode             = public_source_mode(identity.source_mode),
+            .feasible        = identity.physical_status == MaterializationPhysicalStatus::Feasible,
+            .expandable              = identity.expandable,
+            .pressure_may_change_machine_work = identity.pressure_may_change_machine_work,
+            .logical_goal_available  = logical_goal,
+            .candidate_seeded        = seeded,
+            .reused_prompt_tokens    = static_cast<std::uint32_t>(cost.reused_prompt_tokens),
+            .remaining_prefill_tokens =
+                static_cast<std::uint32_t>(cost.remaining_text_prefill),
+            .remaining_vision_prefill =
+                static_cast<std::uint32_t>(cost.remaining_vision_prefill),
+            .predicted_now_ns        = cost.now_ns,
+            .predicted_total_ns      = cost.total_ns,
+            .lower_bound_ns          = cost.lower_bound_ns,
+            .transferred_bytes       = cost.transferred_bytes,
+            .copy_operations         = cost.copy_operations,
+        };
+    }
+
+    // Condensed trace of one assessed pressure target, from the folded cost the planner already
+    // produced and the assessment it came from.
+    [[nodiscard]] static MaterializationTargetTrace
+    target_trace(const FoldedCost& cost, const PressureTargetAssessment& assessment,
+                 bool logical_goal_available) noexcept {
+        return MaterializationTargetTrace{
+            .target_ordinal           = cost.target_ordinal,
+            .root_maximal             = assessment.root_maximal,
+            .logical_goal_available   = logical_goal_available,
+            .degradation_units        = assessment.degradation_units,
+            .reused_prompt_tokens     = static_cast<std::uint32_t>(cost.reused_prompt_tokens),
+            .remaining_prefill_tokens =
+                static_cast<std::uint32_t>(cost.remaining_text_prefill),
+            .remaining_vision_prefill =
+                static_cast<std::uint32_t>(cost.remaining_vision_prefill),
+            .owner_evictions          = cost.owner_evictions,
+            .checkpoint_drops         = cost.checkpoint_drops,
+            .affected_selected_hits   = cost.affected_selected_hits,
+            .transferred_bytes        = cost.transferred_bytes,
+            .copy_operations          = cost.copy_operations,
+            .predicted_now_ns         = cost.now_ns,
+            .predicted_future_loss_ns = cost.future_loss_ns,
+            .predicted_total_ns       = cost.total_ns,
+            .lower_bound_ns           = cost.lower_bound_ns,
         };
     }
 

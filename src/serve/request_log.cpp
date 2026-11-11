@@ -150,6 +150,29 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     return "unknown";
 }
 
+const char* materialization_projection_status_name(
+    ninfer::MaterializationProjectionStatus status) {
+    switch (status) {
+    case ninfer::MaterializationProjectionStatus::Feasible:
+        return "feasible";
+    case ninfer::MaterializationProjectionStatus::Infeasible:
+        return "infeasible";
+    case ninfer::MaterializationProjectionStatus::StructuralInvalid:
+        return "structural_invalid";
+    }
+    return "unknown";
+}
+
+const char* materialization_source_mode_name(ninfer::MaterializationSourceMode mode) {
+    switch (mode) {
+    case ninfer::MaterializationSourceMode::Retain:
+        return "retain";
+    case ninfer::MaterializationSourceMode::ConsumeToActive:
+        return "consume_to_active";
+    }
+    return "unknown";
+}
+
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
     return Json{{"artifact_type", kRequestLogArtifactType},
                 {"schema_version", kRequestLogSchemaVersion},
@@ -294,8 +317,100 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
 }
 
+Json materialization_discovery_json(const ninfer::MaterializationDiscoverySummary& discovery) {
+    return Json{{"prefix_index_entries", discovery.prefix_index_entries},
+                {"valid_prefix_index_entries", discovery.valid_prefix_index_entries},
+                {"shortlist_matches", discovery.shortlist_matches},
+                {"accepted_reuse_candidates", discovery.accepted_reuse_candidates},
+                {"best_reuse_prompt_tokens", discovery.best_reuse_prompt_tokens},
+                {"rejected_invalid_prefix_index_entry",
+                 discovery.rejected_invalid_prefix_index_entry},
+                {"rejected_shortlist_key_mismatch", discovery.rejected_shortlist_key_mismatch},
+                {"rejected_private_active_edge", discovery.rejected_private_active_edge},
+                {"rejected_inspect_admission", discovery.rejected_inspect_admission}};
+}
+
+Json materialization_incumbent_json(const ninfer::MaterializationIncumbentTrace& incumbent) {
+    return Json{{"candidate_id", incumbent.candidate_id},
+                {"target_ordinal", incumbent.target_ordinal},
+                {"reuse_path", prefix_reuse_path_name(incumbent.reuse_path)},
+                {"root_maximal", incumbent.root_maximal},
+                {"degradation_units", incumbent.degradation_units},
+                {"reused_prompt_tokens", incumbent.reused_prompt_tokens},
+                {"predicted_now_ns", incumbent.predicted_now_ns},
+                {"predicted_future_loss_ns", incumbent.predicted_future_loss_ns},
+                {"predicted_total_ns", incumbent.predicted_total_ns}};
+}
+
+Json materialization_target_json(const ninfer::MaterializationTargetTrace& target) {
+    return Json{{"target_ordinal", target.target_ordinal},
+                {"root_maximal", target.root_maximal},
+                {"logical_goal_available", target.logical_goal_available},
+                {"degradation_units", target.degradation_units},
+                {"reused_prompt_tokens", target.reused_prompt_tokens},
+                {"remaining_prefill_tokens", target.remaining_prefill_tokens},
+                {"remaining_vision_prefill", target.remaining_vision_prefill},
+                {"owner_evictions", target.owner_evictions},
+                {"checkpoint_drops", target.checkpoint_drops},
+                {"affected_selected_hits", target.affected_selected_hits},
+                {"transferred_bytes", target.transferred_bytes},
+                {"copy_operations", target.copy_operations},
+                {"predicted_now_ns", target.predicted_now_ns},
+                {"predicted_future_loss_ns", target.predicted_future_loss_ns},
+                {"predicted_total_ns", target.predicted_total_ns},
+                {"lower_bound_ns", target.lower_bound_ns}};
+}
+
+Json materialization_candidate_json(const ninfer::MaterializationCandidateTrace& candidate) {
+    Json best_assessed_target = nullptr;
+    if (candidate.best_assessed_target) {
+        best_assessed_target = materialization_target_json(*candidate.best_assessed_target);
+    }
+    return Json{{"candidate_id", candidate.candidate_id},
+                {"identity_target_ordinal", candidate.identity_target_ordinal},
+                {"reuse_path", prefix_reuse_path_name(candidate.reuse_path)},
+                {"current_session_binding", candidate.current_session_binding},
+                {"physical_status",
+                 materialization_projection_status_name(candidate.physical_status)},
+                {"source_mode", materialization_source_mode_name(candidate.source_mode)},
+                {"feasible", candidate.feasible},
+                {"expandable", candidate.expandable},
+                {"pressure_may_change_machine_work",
+                 candidate.pressure_may_change_machine_work},
+                {"logical_goal_available", candidate.logical_goal_available},
+                {"candidate_seeded", candidate.candidate_seeded},
+                {"reused_prompt_tokens", candidate.reused_prompt_tokens},
+                {"remaining_prefill_tokens", candidate.remaining_prefill_tokens},
+                {"remaining_vision_prefill", candidate.remaining_vision_prefill},
+                {"predicted_now_ns", candidate.predicted_now_ns},
+                {"predicted_total_ns", candidate.predicted_total_ns},
+                {"lower_bound_ns", candidate.lower_bound_ns},
+                {"transferred_bytes", candidate.transferred_bytes},
+                {"copy_operations", candidate.copy_operations},
+                {"targets_discovered", candidate.targets_discovered},
+                {"targets_assessed", candidate.targets_assessed},
+                {"feasible_targets", candidate.feasible_targets},
+                {"best_assessed_target", std::move(best_assessed_target)}};
+}
+
+Json materialization_budget_decision_json(
+    const ninfer::MaterializationBudgetDecisionTrace& decision) {
+    return Json{{"elapsed_ns", decision.elapsed_ns},
+                {"granted_ns", decision.granted_ns},
+                {"remaining_allowance_ns", decision.remaining_allowance_ns},
+                {"next_operation_ns", decision.next_operation_ns},
+                {"completion_ns", decision.completion_ns},
+                {"gain_ns", decision.gain_ns},
+                {"economic_gain_budget_ns", decision.economic_gain_budget_ns},
+                {"complete_prediction", decision.complete_prediction},
+                {"discovery_eligible", decision.discovery_eligible},
+                {"discovery_used", decision.discovery_used},
+                {"progress", decision.progress},
+                {"renewal_progress", decision.renewal_progress}};
+}
+
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
-    return Json{
+    Json result{
         {"predicted_now_ns", diagnostics.predicted_now_ns},
         {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
         {"predicted_total_ns", diagnostics.predicted_total_ns},
@@ -307,6 +422,9 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        {"discovery", materialization_discovery_json(diagnostics.discovery)},
+        {"initial_incumbent", materialization_incumbent_json(diagnostics.initial_incumbent)},
+        {"selected_incumbent", materialization_incumbent_json(diagnostics.selected_incumbent)},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)
@@ -320,7 +438,17 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_stop_phase",
          ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
         {"search_boundary_limited", diagnostics.search_boundary_limited},
+        {"search_budget_refusal",
+         ninfer::materialization_budget_refusal_name(diagnostics.search_budget_refusal)},
+        {"search_budget_decision",
+         materialization_budget_decision_json(diagnostics.search_budget_decision)},
     };
+    Json candidates = Json::array();
+    for (const ninfer::MaterializationCandidateTrace& candidate : diagnostics.candidates) {
+        candidates.push_back(materialization_candidate_json(candidate));
+    }
+    result["candidates"] = std::move(candidates);
+    return result;
 }
 
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
