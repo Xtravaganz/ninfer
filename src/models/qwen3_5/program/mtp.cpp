@@ -25,13 +25,15 @@ Tensor host_step(const Tensor& storage, std::uint32_t step, std::int32_t element
 
 execution::MtpExecutionView mtp_view(const execution::Parameters& parameters, Resources& resources,
                                      CudaExecutionView execution, ProposalHead proposal_head,
-                                     const DeviceBuffer& indexed88_ids) {
+                                     const DeviceBuffer& indexed88_ids,
+                                     const MtpFullProbe* full_probe) {
     if (!resources.frame.mtp || !resources.decoder.mtp_cache()) {
         throw std::logic_error("MTP execution resources are unavailable");
     }
     return {parameters, resources.work, execution,
             resources.decoder.mtp_cache()->batch_layer_view(0), proposal_head,
-            static_cast<const std::int32_t*>(indexed88_ids.data())};
+            static_cast<const std::int32_t*>(indexed88_ids.data()),
+            full_probe ? full_probe->view() : nullptr};
 }
 
 Tensor causal_rope(const Tensor& rope, int width, int batch) {
@@ -83,7 +85,7 @@ void RankProgramImpl::run_mtp_draft(std::uint32_t batch_size, std::uint32_t step
     const auto cuda          = device.execution_view();
     const auto batch         = static_cast<std::int32_t>(batch_size);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
-    const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids);
+    const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids, full_probe.get());
     auto base                = packed(mtp.base_conditioning, {hidden, batch});
     gather_conditioning(resources, batch, cuda);
     auto logits = packed(mtp.proposal_logits,
@@ -128,7 +130,7 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     auto& frame              = resources.frame;
     auto& mtp                = *frame.mtp;
     const auto cuda          = device.execution_view();
-    const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids);
+    const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids, full_probe.get());
     const auto batch         = forward ? 1 : static_cast<std::int32_t>(operation.batch);
     const auto width         = static_cast<std::int32_t>(operation.width);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
@@ -204,7 +206,7 @@ void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
         .valid_columns   = mtp.history_columns.slice(0, 0, batch),
         .kv_table_rows   = frame.backend_table_rows.slice(0, 0, batch),
     };
-    execution::mtp_history(mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids), inputs,
+    execution::mtp_history(mtp_view(parameters, resources, cuda, proposal_head, indexed88_ids, full_probe.get()), inputs,
                            {0, draft_window});
 }
 

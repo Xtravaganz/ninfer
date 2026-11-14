@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
+#include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -28,6 +30,20 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
         if (generated && frame.host_ingress->sampling[i].token_counts) {
             frame.host_commit->count_columns[i] = accepted;
             count_tokens |= accepted != 0;
+        }
+    }
+    // Only committed target output is counted; never record rejected MTP drafts.
+    if (target_coverage && target_coverage->enabled() && generated) {
+        const std::size_t stride = operation.speculative ? draft_window + 1 : 1;
+        for (std::uint32_t row = 0; row < operation.batch; ++row) {
+            const auto& decision = value.rows[row];
+            const std::size_t accepted = decision.discarded ? 0 : decision.accepted_tokens;
+            if (accepted == 0 || accepted > stride || accepted > 16) continue;
+            std::array<std::int32_t, 16> token_ids{};
+            for (std::size_t i = 0; i < accepted; ++i)
+                token_ids[i] = frame.host_egress->tokens[row * stride + i];
+            target_coverage->record_committed(
+                std::span<const std::int32_t>(token_ids.data(), accepted));
         }
     }
     bool device_work = decode || count_tokens;
@@ -173,6 +189,7 @@ void RankProgramImpl::retire_compute() {
                            : ExecutionPath::Eager;
     compute.reset();
     resources.work.reset();
+    if (full_probe) full_probe->snapshot_if_due(device);
     events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }
 

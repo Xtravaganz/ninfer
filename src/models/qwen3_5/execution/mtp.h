@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/execution/parameters.h"
+#include "ninfer/ops/mtp_full_probe.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/types.h"
@@ -27,6 +28,8 @@ struct MtpExecutionView {
     ProposalHead proposal_head = ProposalHead::Full;
     // Null unless the ThinkingCap 135K Indexed88 direct path is enabled.
     const std::int32_t* indexed88_ids = nullptr;
+    // Optional observational full-head sampling. Never changes proposals.
+    const ops::MtpFullProbeDevice* full_probe = nullptr;
 };
 
 // Each live column pairs target conditioning H[p] with token x[p+1], writes cache position p,

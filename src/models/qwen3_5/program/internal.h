@@ -10,6 +10,8 @@
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/resources.h"
+#include "models/qwen3_5/program/mtp_target_coverage.h"
+#include "models/qwen3_5/program/mtp_full_probe.h"
 #include "models/qwen3_5/program/graphs.h"
 #include "models/qwen3_5/program/planning/startup.h"
 
@@ -157,6 +159,8 @@ public:
     Resources resources;
     // 88,064 ascending I32 IDs on device; empty unless explicit opt-in.
     DeviceBuffer indexed88_ids;
+    std::unique_ptr<MtpFullProbe> full_probe;
+    std::unique_ptr<MtpTargetCoverage> target_coverage;
     std::unique_ptr<context::ContextStorage> storage;
     std::unique_ptr<context::ContextMigration> compute_actions;
     std::unique_ptr<context::ContextMigration> context_actions;

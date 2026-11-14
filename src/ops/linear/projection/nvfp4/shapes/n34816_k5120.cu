@@ -6,7 +6,7 @@ namespace ninfer::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<34816, 5120>;
 using Gemv =
-    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4A16GemvSchedule<8, 4, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 using C2      = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
                                      Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;

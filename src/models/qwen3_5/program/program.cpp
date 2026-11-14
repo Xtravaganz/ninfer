@@ -70,6 +70,9 @@ std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& pa
         impl->initialize_graphs(mode);
         phase.complete();
     }
+    // Clear simulated samples from graph-memory calibration before live requests.
+    if (impl->full_probe && plan.impl_->use_cuda_graph)
+        impl->full_probe->reset_after_graph_preparation(device);
     plan.impl_.reset();
     return std::unique_ptr<RankProgram>(new RankProgram(std::move(impl)));
 }

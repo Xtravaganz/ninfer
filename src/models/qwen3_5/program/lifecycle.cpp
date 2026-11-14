@@ -3,6 +3,9 @@
 #include "ninfer/ops/indexed88_q8.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cstdio>
+#include <span>
 #include <cstdlib>
 #include <filesystem>
 #include <cstdint>
@@ -42,16 +45,18 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
             throw std::invalid_argument("Indexed88 direct mode requires NINFER_MTP_INDEXED_MODE=indexed96");
         }
         if (backend != SpeculativeBackend::Mtp || proposal_head != ProposalHead::Full ||
-            !parameters.mtp || parameters.profile->public_tokens != 135000 ||
-            parameters.profile->config.text.vocab_size != 135168 ||
+            !parameters.mtp ||
+            !ops::thinkingcap_indexed88_geometry(parameters.profile->public_tokens,
+                                                   parameters.profile->config.text.vocab_size) ||
             parameters.profile->config.text.hidden_size != 5120) {
-            throw std::invalid_argument("Indexed88 requires the 135K ThinkingCap MTP full-head configuration");
+            throw std::invalid_argument("Indexed88 requires ThinkingCap 135K, Compact131206 or Compact129430 MTP full-head geometry");
         }
         const auto& head = parameters.mtp->output_head.weight;
-        if (head.device != device.device() || head.n != 135168 || head.k != 5120 ||
+        if (head.device != device.device() ||
+            head.n != parameters.profile->config.text.vocab_size || head.k != 5120 ||
             head.padded_shape[1] != 5120 || head.qtype != QType::Q8_G32_FP16 ||
             head.layout != QuantLayout::RowSplit || head.group_size != 32) {
-            throw std::invalid_argument("Indexed88 requires the physical 135168x5120 Q8 G32 head");
+            throw std::invalid_argument("Indexed88 requires the matching physical 135168/131328/129536x5120 Q8 G32 head");
         }
         const char* path = std::getenv("NINFER_MTP_INDEXED_RANKING");
         if (!path || path[0] != '/') {
@@ -71,13 +76,44 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
         }
         std::int32_t previous = -1;
         for (const std::int32_t id : ids) {
-            if (id <= previous || id >= 135000) {
-                throw std::runtime_error("Indexed88 ranking must contain 88064 strictly ascending IDs in [0,135000)");
+            if (id <= previous || id >= parameters.profile->public_tokens) {
+                throw std::runtime_error("Indexed88 ranking must contain 88064 strictly ascending IDs in [0,public_tokens)");
             }
             previous = id;
         }
         indexed88_ids = DeviceBuffer(device.device(), bytes);
         indexed88_ids.copy_from_host(ids.data(), bytes);
+        // Only the live rank records observations. Do not emit calibration artifacts.
+        if (!plan.graph_probe) {
+            if (const char* dir = std::getenv("NINFER_MTP_FULL_PROBE_DIR"); dir && *dir) {
+                std::uint32_t stride = 64;
+                if (const char* raw = std::getenv("NINFER_MTP_FULL_PROBE_STRIDE"); raw && *raw) {
+                    const auto end = raw + std::char_traits<char>::length(raw);
+                    const auto parsed = std::from_chars(raw, end, stride);
+                    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                        stride < 1 || stride > 4096)
+                        throw std::invalid_argument("NINFER_MTP_FULL_PROBE_STRIDE must be 1..4096");
+                }
+                full_probe = std::make_unique<MtpFullProbe>(
+                    std::filesystem::path(dir), device, indexed88_ids,
+                    std::span<const std::int32_t>(ids.data(), ids.size()), stride,
+                    parameters.profile->public_tokens);
+            }
+            if (const char* freq_dir = std::getenv("NINFER_MTP_FREQ_DIR"); freq_dir && *freq_dir) {
+                // Target collector is optional; failure must not alter generation.
+                try {
+                    target_coverage = std::make_unique<MtpTargetCoverage>(
+                        std::filesystem::path(freq_dir),
+                        std::span<const std::int32_t>(ids.data(), ids.size()),
+                        parameters.profile->public_tokens);
+                    if (!target_coverage->enabled())
+                        std::fprintf(stderr, "[mtp-target-coverage] disabled: writer initialization failed\n");
+                } catch (...) {
+                    std::fprintf(stderr, "[mtp-target-coverage] disabled: initialization exception\n");
+                    target_coverage.reset();
+                }
+            }
+        }
     }
     std::vector<context::ContextTableStorage> tables{{0, &resources.decoder.text_kv.tables()}};
     if (auto* cache = resources.backend_kv()) tables.push_back({1, &cache->tables()});
@@ -104,6 +140,10 @@ RankProgramImpl::~RankProgramImpl() {
         device.bind_to_current_thread_noexcept();
         (void)cudaStreamSynchronize(device.stream());
         (void)cudaStreamSynchronize(device.transfer_stream());
+    }
+    if (full_probe) {
+        try { full_probe->snapshot_if_due(device, true); }
+        catch (...) { std::fprintf(stderr, "[mtp-full-probe] final readback failed\n"); }
     }
 }
 

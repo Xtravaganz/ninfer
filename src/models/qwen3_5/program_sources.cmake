@@ -11,6 +11,8 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/inputs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/mtp.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/mtp_target_coverage.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/mtp_full_probe.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/draft_commit.cpp"

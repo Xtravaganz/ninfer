@@ -58,12 +58,13 @@ void indexed88_q8_propose(const Tensor& hidden, const Weight& physical_q8_head,
                    execution.device());
     require_tensor(proposal_ids, DType::I32, tokens, 1, execution.device());
     if (physical_q8_head.device != execution.device() ||
-        physical_q8_head.n != 135168 || physical_q8_head.k != 5120 ||
+        !thinkingcap_indexed88_physical_rows(physical_q8_head.n) ||
+        physical_q8_head.k != 5120 ||
         physical_q8_head.padded_shape[1] != 5120 ||
         physical_q8_head.qtype != QType::Q8_G32_FP16 ||
         physical_q8_head.layout != QuantLayout::RowSplit ||
         physical_q8_head.group_size != 32) {
-        throw std::invalid_argument("Indexed88: expected physical Q8 G32 135168x5120 head");
+        throw std::invalid_argument("Indexed88: expected physical Q8 G32 135168/131328/129536x5120 head");
     }
 
     const detail::Q8LinearOperands operands =

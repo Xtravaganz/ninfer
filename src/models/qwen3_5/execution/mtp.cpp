@@ -287,8 +287,9 @@ void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logi
             // Reinterpret the already allocated full-head logits storage as a compact
             // contiguous [88064,C] scratch view. No new 88K logits allocation, and
             // neither a second Q8 weight matrix nor a second full-head projection.
-            if (config.vocab_size != 135168 || state.parameters.profile->public_tokens != 135000) {
-                throw std::invalid_argument("Indexed88: expected 135K public/physical vocabulary");
+            if (!ops::thinkingcap_indexed88_geometry(
+                    state.parameters.profile->public_tokens, config.vocab_size)) {
+                throw std::invalid_argument("Indexed88: unsupported public/physical vocabulary pair");
             }
             if (columns > 8) {
                 throw std::invalid_argument("Indexed88: MTP proposal width exceeds 8");
@@ -297,6 +298,24 @@ void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logi
                                   DType::BF16, {ops::kThinkingCapIndexed88Rows, columns});
             ops::indexed88_q8_propose(hidden, parameters.output_head.weight,
                                       state.indexed88_ids, compact_logits, ids, state.execution);
+            // GPU-side sampling also works during CUDA Graph replay. Observation only.
+            if (state.full_probe) {
+                ops::mtp_full_top1_probe(hidden, parameters.output_head.weight, compact_logits,
+                                         ids, *state.full_probe, state.execution);
+                if (state.full_probe->audit) {
+                    // Independent numerical reference. Disabled in normal production.
+                    ops::linear(hidden, parameters.output_head.weight, full_logits,
+                                parameters.output_head.policy, state.workspace, state.execution);
+                    Tensor native_ids(
+                        {state.full_probe->audit_native,
+                         ops::kFullProbeColumns * sizeof(std::int32_t), state.execution.device()},
+                        DType::I32, {columns});
+                    ops::argmax(full_logits, native_ids,
+                                dimension(state.parameters.profile->public_tokens), state.execution);
+                    ops::mtp_full_probe_audit_compare(native_ids, *state.full_probe,
+                                                      state.execution);
+                }
+            }
             return;
         }
         ops::linear(hidden, parameters.output_head.weight, full_logits,
