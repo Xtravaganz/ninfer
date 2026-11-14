@@ -59,14 +59,14 @@ public:
                 "routed_swiglu CPU: weight bank differs from the profile");
         require(geometry.group_size == (nvfp4 ? 16 : 64) &&
                     geometry.padded_columns == unsigned(columns) &&
-                    geometry.scale_block_rows == 1 && layout.has_divisors == nvfp4,
+                    geometry.scale_block_rows == 1 && layout.has_matrix_scales == nvfp4,
                 "routed_swiglu CPU: invalid weight geometry");
         require(layout.codes.expert_bytes == elements / 2 &&
                     layout.high.expert_bytes == high_bytes &&
                     layout.scales.expert_bytes == elements / (nvfp4 ? 16 : 32) &&
                     layout == describe_weight_bank(geometry, layout.region),
                 "routed_swiglu CPU: invalid native weight planes");
-        require(bank.parent->weight_divisors.size() == geometry.divisor_count,
+        require(bank.parent->matrix_scales.size() == geometry.matrix_scale_count,
                 "routed_swiglu CPU: invalid divisor storage");
         for (int expert = 0; expert < count; ++expert) {
             if (!selected[expert]) { continue; }
@@ -78,8 +78,9 @@ public:
                 read(memory.data, memory.bytes);
             }
             if (nvfp4) {
-                const auto* divisor = bank.parent->weight_divisors.data() + layout.divisor_begin +
-                                      expert * layout.divisor_stride;
+                const auto* divisor = bank.parent->matrix_scales.data() +
+                                      layout.matrix_scale_begin +
+                                      expert * layout.matrix_scale_stride;
                 require(std::isfinite(*divisor) && *divisor > 0,
                         "routed_swiglu CPU: invalid expert divisor");
                 read(divisor, sizeof(float));
@@ -142,9 +143,14 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         const auto offset = std::size_t(t) * profile.top_k;
         for (int j = 0; j < profile.top_k; ++j) {
             const int expert = ids[offset + j];
-            require(expert >= 0 && expert < profile.experts &&
+            require(expert >= -1 && expert < profile.experts &&
                         std::isfinite(coefficients[offset + j]),
                     "routed_swiglu CPU: invalid route ID or coefficient");
+            if (expert == -1) {
+                require(coefficients[offset + j] == 0,
+                        "routed_swiglu CPU: absent route must have zero coefficient");
+                continue;
+            }
             for (int previous = 0; previous < j; ++previous) {
                 require(expert != ids[offset + previous], "routed_swiglu CPU: duplicate route ID");
             }

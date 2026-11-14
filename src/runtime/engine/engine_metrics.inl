@@ -24,13 +24,21 @@ std::uint64_t EngineCore<Instance>::elapsed_ns(Clock::time_point started,
 }
 
 template <class Instance>
-typename EngineCore<Instance>::ActiveExposureSet EngineCore<Instance>::active_exposure_set() const {
-    ActiveExposureSet result;
+typename EngineCore<Instance>::ExposureSnapshot EngineCore<Instance>::active_exposure_set() const {
+    if (completion_exposure_) return completion_exposure_->exposed;
+    if (active_exposure_) return active_exposure_;
+    auto result        = std::make_shared<ActiveExposureSet>();
+    result->work_class = current_host_work_class_;
+    result->entries.reserve(max_concurrency_);
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-        if (slots_[lane] == nullptr) { continue; }
-        result.entries[result.size++] = ActiveExposure{.request = slots_[lane], .lane = lane};
+        const auto& request = slots_[lane];
+        if (!request) continue;
+        result->entries.push_back({request, lane,
+                                   current_host_work_class_ == HostWorkClass::Decode &&
+                                       current_decode_requests_[lane] == request->id});
     }
-    return result;
+    active_exposure_ = std::move(result);
+    return active_exposure_;
 }
 
 template <class Instance>
@@ -43,29 +51,87 @@ typename EngineCore<Instance>::HostPhaseMeasurement EngineCore<Instance>::begin_
 }
 
 template <class Instance>
-void EngineCore<Instance>::set_host_work_class(
-    HostWorkClass work_class, std::span<const std::uint32_t> decode_lanes) noexcept {
-    current_host_work_class_   = work_class;
-    current_decode_lane_count_ = decode_lanes.size();
-    for (std::size_t i = 0; i < decode_lanes.size(); ++i) {
-        current_decode_lanes_[i] = decode_lanes[i];
+HostExposureClock EngineCore<Instance>::exposure_clock() const noexcept {
+    const auto& t = cumulative_stats_.host_work;
+    return {{t.engine_boundary_ns, t.engine_commit_output_ns, t.engine_maintenance_ns},
+            {t.session_call_ns, t.executor_poll_ns, t.executor_flush_ns, t.scheduler_yield_ns}};
+}
+
+template <class Instance>
+RequestHostTiming EngineCore<Instance>::request_host_timing(const Request& request) const noexcept {
+    auto timing = request.host_timing;
+    if (completion_exposure_ && request.completion_exposure_row) {
+        const auto& row = completion_exposure_->exposed->entries[*request.completion_exposure_row];
+        timing.expose_since(completion_exposure_->first, exposure_clock(), row.decode);
     }
+    return timing;
 }
 
 template <class Instance>
-bool EngineCore<Instance>::current_decode_contains(std::uint32_t lane) const noexcept {
-    return std::find(current_decode_lanes_.begin(),
-                     current_decode_lanes_.begin() +
-                         static_cast<std::ptrdiff_t>(current_decode_lane_count_),
-                     lane) !=
-           current_decode_lanes_.begin() + static_cast<std::ptrdiff_t>(current_decode_lane_count_);
+void EngineCore<Instance>::finish_completion_exposure() noexcept {
+    if (!completion_exposure_) return;
+    const auto last = exposure_clock();
+    for (const auto& row : completion_exposure_->exposed->entries) {
+        const auto* completed = row.request->completion_index
+                                    ? &pending_completions_[*row.request->completion_index]
+                                    : nullptr;
+        row.request->host_timing.expose_since(
+            completion_exposure_->first,
+            completed && completed->ready ? completed->exposure_end : last, row.decode);
+        row.request->completion_exposure_row.reset();
+    }
+    completion_exposure_.reset();
+    for (auto& completed : pending_completions_)
+        if (completed.ready && !completed.error)
+            completed.result.stats.engine_timing = completed.request->host_timing.public_snapshot();
 }
 
 template <class Instance>
-void EngineCore<Instance>::add_class_host_time(std::uint64_t host_ns,
+void EngineCore<Instance>::set_resident(std::uint32_t lane,
+                                        std::shared_ptr<Request> request) noexcept {
+    slots_[lane] = std::move(request);
+    active_exposure_.reset();
+}
+
+template <class Instance>
+void EngineCore<Instance>::set_host_work_class(HostWorkClass work_class,
+                                               std::span<const std::uint32_t> decode_lanes) {
+    if (work_class != HostWorkClass::Decode && !decode_lanes.empty())
+        throw std::logic_error("non-decode host work has decode members");
+    bool unchanged = current_host_work_class_ == work_class &&
+                     std::equal(current_decode_lanes_.begin(), current_decode_lanes_.end(),
+                                decode_lanes.begin(), decode_lanes.end());
+    for (auto lane : decode_lanes) {
+        if (lane >= slots_.size() || !slots_[lane])
+            throw std::logic_error("decode host work has no resident member");
+        unchanged &= current_decode_requests_[lane] == slots_[lane]->id;
+    }
+    if (unchanged) return;
+    for (auto lane : current_decode_lanes_) current_decode_requests_[lane] = 0;
+    current_decode_lanes_.assign(decode_lanes.begin(), decode_lanes.end());
+    for (auto lane : current_decode_lanes_) current_decode_requests_[lane] = slots_[lane]->id;
+    current_host_work_class_ = work_class;
+    active_exposure_.reset();
+}
+
+template <class Instance>
+void EngineCore<Instance>::restore_host_work_class(const ActiveExposureSet& previous) noexcept {
+    for (auto lane : current_decode_lanes_) current_decode_requests_[lane] = 0;
+    current_decode_lanes_.clear();
+    for (const auto& entry : previous.entries) {
+        if (!entry.decode) continue;
+        current_decode_lanes_.push_back(entry.lane);
+        current_decode_requests_[entry.lane] = entry.request->id;
+    }
+    current_host_work_class_ = previous.work_class;
+    active_exposure_.reset();
+}
+
+template <class Instance>
+void EngineCore<Instance>::add_class_host_time(HostWorkClass work_class, std::uint64_t host_ns,
                                                std::uint64_t scheduler_yield_ns) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
-    switch (current_host_work_class_) {
+    switch (work_class) {
     case HostWorkClass::Decode:
         stats.decode_host_ns += host_ns;
         stats.decode_scheduler_yield_ns += scheduler_yield_ns;
@@ -85,13 +151,9 @@ template <class Instance>
 void EngineCore<Instance>::expose_engine_phase(const ActiveExposureSet& exposed,
                                                EngineHostPhase phase,
                                                std::uint64_t elapsed) noexcept {
-    for (std::size_t i = 0; i < exposed.size; ++i) {
-        const ActiveExposure& exposure = exposed.entries[i];
-        RequestHostTiming& timing      = exposure.request->host_timing;
-        timing.expose_engine(phase, elapsed,
-                             current_host_work_class_ == HostWorkClass::Decode &&
-                                 current_decode_contains(exposure.lane));
-    }
+    if (completion_exposure_ && completion_exposure_->exposed.get() == &exposed) return;
+    for (const auto& exposure : exposed.entries)
+        exposure.request->host_timing.expose_engine(phase, elapsed, exposure.decode);
 }
 
 template <class Instance>
@@ -112,8 +174,8 @@ void EngineCore<Instance>::finish_engine_phase(const HostPhaseMeasurement& measu
         stats.engine_maintenance_ns += own;
         break;
     }
-    add_class_host_time(own, 0);
-    expose_engine_phase(measurement.exposed, phase, own);
+    add_class_host_time(measurement.exposed->work_class, own, 0);
+    expose_engine_phase(*measurement.exposed, phase, own);
     worker_accounted_elapsed_ns_ += own;
 }
 
@@ -136,14 +198,10 @@ void EngineCore<Instance>::record_coordinator_call(CoordinatorCall call, std::ui
         break;
     }
     const bool yielding = call == CoordinatorCall::Yield;
-    add_class_host_time(yielding ? 0 : elapsed, yielding ? elapsed : 0);
-    for (std::size_t i = 0; i < exposed.size; ++i) {
-        const auto& exposure = exposed.entries[i];
-        exposure.request->host_timing.expose_call(call, elapsed,
-                                                  current_host_work_class_ ==
-                                                          HostWorkClass::Decode &&
-                                                      current_decode_contains(exposure.lane));
-    }
+    add_class_host_time(exposed.work_class, yielding ? 0 : elapsed, yielding ? elapsed : 0);
+    if (!completion_exposure_ || completion_exposure_->exposed.get() != &exposed)
+        for (const auto& exposure : exposed.entries)
+            exposure.request->host_timing.expose_call(call, elapsed, exposure.decode);
     worker_accounted_elapsed_ns_ += elapsed;
 }
 
@@ -152,7 +210,7 @@ void EngineCore<Instance>::finish_execution_call(const HostPhaseMeasurement& mea
                                                  CoordinatorCall call) noexcept {
     const auto wall   = elapsed_ns(measurement.started, Clock::now());
     const auto nested = worker_accounted_elapsed_ns_ - measurement.accounted_before;
-    record_coordinator_call(call, wall > nested ? wall - nested : 0, measurement.exposed);
+    record_coordinator_call(call, wall > nested ? wall - nested : 0, *measurement.exposed);
 }
 
 template <class Instance>
@@ -165,7 +223,79 @@ void EngineCore<Instance>::record_detail(std::uint64_t RuntimeHostWorkStats::*el
 }
 
 template <class Instance>
+RequestSnapshot EngineCore<Instance>::observe_request(const Request& request) const {
+    RequestSnapshot out;
+    out.id = request.id;
+    switch (request.model_state) {
+    case EngineRequestState::Waiting:
+        out.phase = RequestPhase::Waiting;
+        break;
+    case EngineRequestState::Materializing:
+        out.phase = RequestPhase::Materializing;
+        break;
+    case EngineRequestState::Prefill:
+        out.phase = RequestPhase::Prefill;
+        break;
+    case EngineRequestState::DecodeReady:
+        out.phase = RequestPhase::Decode;
+        break;
+    case EngineRequestState::ControlReady:
+        out.phase = RequestPhase::Control;
+        break;
+    case EngineRequestState::Replay:
+        out.phase = RequestPhase::Replay;
+        break;
+    case EngineRequestState::Pausing:
+        out.phase = RequestPhase::Pausing;
+        break;
+    case EngineRequestState::Paused:
+        out.phase = RequestPhase::Paused;
+        break;
+    case EngineRequestState::ModelFinished:
+        out.phase = RequestPhase::Finishing;
+        break;
+    }
+    if (request.terminal_reason || request.terminal_error) out.phase = RequestPhase::Finishing;
+    if (request.placement) out.placement = request.placement->value;
+    out.submitted_ns = elapsed_ns({}, request.submitted);
+    if (request.admitted_at) out.admitted_ns = elapsed_ns({}, *request.admitted_at);
+    if (request.first_token) out.first_token_ns = elapsed_ns({}, *request.first_token);
+    out.prompt_tokens = request.prompt_summary.prompt_tokens;
+    if (request.admitted_begin)
+        out.reused_prompt_tokens = request.admitted_begin->reused_prompt_tokens;
+    out.processed_prompt_tokens = out.reused_prompt_tokens + request.computed_prompt_tokens;
+    out.generated_tokens        = static_cast<std::uint32_t>(request.generated.size());
+    out.injected_control_tokens = request.injected_control_tokens;
+    out.logical_context_tokens  = out.processed_prompt_tokens + out.generated_tokens;
+    if (request.budget) out.output_token_limit = out.generated_tokens + request.budget->remaining();
+    out.capture_pending  = request.capture_pending;
+    out.resident         = request.lane && slots_[request.lane->value].get() == &request;
+    out.preemptions      = request.preemption_count;
+    out.replayed_tokens  = request.replayed_tokens;
+    out.recovery         = request.recovery;
+    out.recovery_pending = request.recovery_pending;
+    if (request.last_progress) out.last_progress_ns = elapsed_ns({}, *request.last_progress);
+    out.execution_in_flight = request.execution_in_flight;
+    return out;
+}
+
+template <class Instance>
+void EngineCore<Instance>::record_completion(const std::shared_ptr<Request>& request,
+                                             FinishReason reason, bool failed) {
+    if (request->completion_observed) return;
+    request->completion_observed = true;
+    auto& counters               = cumulative_stats_.requests;
+    if (failed)
+        ++counters.failed;
+    else if (reason == FinishReason::Cancelled)
+        ++counters.cancelled;
+    else
+        ++counters.completed;
+}
+
+template <class Instance>
 void EngineCore<Instance>::publish_runtime_stats() {
+    const auto published_revision    = schedule_revision_.load(std::memory_order_acquire);
     HostPhaseMeasurement measurement = begin_host_phase();
     std::optional<nvtx::ScopedRange> phase_range;
     phase_range.emplace(nvtx::Name::EngineMaintenance, nvtx::Category::Runtime);
@@ -179,6 +309,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.decode_row_rounds = executions[static_cast<std::size_t>(ExecutionKind::Decode)].rows;
     const auto physical        = instance_.session->physical_usage();
     snapshot.context_pools     = physical.pools;
+    snapshot.context_resources = physical.resources;
+    snapshot.prefix_cache      = resources_.statistics();
     snapshot.context_metadata  = physical.metadata;
     snapshot.state_objects     = physical.state_objects;
     snapshot.history_objects   = physical.history_objects;
@@ -186,9 +318,19 @@ void EngineCore<Instance>::publish_runtime_stats() {
         pool.occupied_page_groups = physical.kv_page_groups.at(pool.id);
     }
 
+    request_observations_.clear();
+    execution_observations_.clear();
+    instance_.executor->observe_in_flight(execution_observations_);
+    EngineStatus status;
     {
         std::lock_guard lock(queue_mutex_);
-        snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        snapshot.waiting_requests   = static_cast<std::uint32_t>(pending_.size());
+        snapshot.requests.submitted = submitted_requests_;
+        status                      = stopping_ ? EngineStatus::Stopping
+                                      : failed_ ? EngineStatus::Failed
+                                                : EngineStatus::Ready;
+        for (const auto& request : pending_)
+            request_observations_.push_back(observe_request(*request));
     }
     snapshot.prefilling_requests    = 0;
     snapshot.paused_requests        = static_cast<std::uint32_t>(paused_.size());
@@ -196,12 +338,37 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
+        request_observations_.push_back(observe_request(*slots_[lane]));
         ++snapshot.running_requests;
         if (slots_[lane]->is_prefilling()) { ++snapshot.prefilling_requests; }
         if (slots_[lane]->is_replaying()) { ++snapshot.replaying_requests; }
         if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
         if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
+    }
+    for (const auto& request : paused_) request_observations_.push_back(observe_request(*request));
+    if (materializing_) request_observations_.push_back(observe_request(*materializing_->request));
+    std::sort(request_observations_.begin(), request_observations_.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    request_observations_.erase(
+        std::unique(request_observations_.begin(), request_observations_.end(),
+                    [](const auto& a, const auto& b) { return a.id == b.id; }),
+        request_observations_.end());
+    for (auto& placement : snapshot.placements) {
+        const auto id = placement.id;
+        placement     = {.id = id};
+    }
+    for (const auto& request : request_observations_) {
+        if (!request.placement) continue;
+        auto found = std::find_if(snapshot.placements.begin(), snapshot.placements.end(),
+                                  [&](const auto& item) { return item.id == *request.placement; });
+        if (found == snapshot.placements.end()) continue;
+        found->resident += request.resident;
+        found->prefilling += request.phase == RequestPhase::Prefill;
+        found->decoding += request.phase == RequestPhase::Decode;
+        found->replaying += request.phase == RequestPhase::Replay;
+        found->paused += request.phase == RequestPhase::Paused;
+        found->context_tokens += request.logical_context_tokens;
     }
     detail_range.reset();
     record_detail(&RuntimeHostWorkStats::stats_publication_ns,
@@ -217,7 +384,14 @@ void EngineCore<Instance>::publish_runtime_stats() {
     published_snapshot_.stamp   = {published_snapshot_.stamp.sequence + 1, observation_time_ns()};
     published_snapshot_.runtime = snapshot;
     published_snapshot_.executions = instance_.executor->execution_statistics();
-    const auto ranks               = instance_.executor->observations();
+    const auto batches = instance_.executor->decode_statistics().first(max_concurrency_);
+    published_snapshot_.decode_by_batch.assign(batches.begin(), batches.end());
+    published_snapshot_.in_flight      = execution_observations_;
+    published_snapshot_.status         = status;
+    published_snapshot_.progress_owner = scheduler_.progress_owner();
+    published_requests_                = request_observations_;
+    published_revision_                = published_revision;
+    const auto ranks                   = instance_.executor->observations();
     published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
 }
 
@@ -269,6 +443,10 @@ void EngineCore<Instance>::record_context_work(
         }
         longest_rank_ns = std::max(longest_rank_ns, rank_ns);
     }
+    if (owner && materializing_ && materializing_->resumed &&
+        progress.kind == decltype(progress.kind)::Bind)
+        scheduler_.recovery_work(owner->id, longest_rank_ns);
+
     cumulative_stats_.actual_context_transfer_seconds += longest_rank_ns * 1.0e-9;
 }
 
@@ -278,13 +456,14 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
     auto& snapshot                   = request->first_output_timing.emplace();
     snapshot.elapsed_seconds         = elapsed_ns(request->submitted, now) * 1.0e-9;
     snapshot.initial_binding_seconds = request->initial_binding_ns * 1.0e-9;
-    snapshot.engine                  = request->host_timing.public_snapshot();
+    snapshot.engine                  = request_host_timing(*request).public_snapshot();
     snapshot.prefill = request->executions[static_cast<std::size_t>(ExecutionKind::Prefill)];
     snapshot.replay  = request->executions[static_cast<std::size_t>(ExecutionKind::Replay)];
     snapshot.pending_execution = request->pending_execution;
     snapshot.scheduling        = {
                .preemptions       = request->preemption_count,
                .snapshot_restores = request->snapshot_restores,
+               .direct_restores   = request->direct_restores,
                .replay_restores   = request->replay_restores,
                .replayed_tokens   = request->replayed_tokens,
                .paused_ns =

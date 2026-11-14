@@ -20,7 +20,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 31;
+inline constexpr int kRequestLogSchemaVersion        = 32;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -74,7 +74,7 @@ ServerLogEnvironment query_server_log_environment(int device);
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
 class JsonlRequestLog {
 public:
-    explicit JsonlRequestLog(const std::string& path,
+    explicit JsonlRequestLog(std::string server_instance_id, const std::string& path,
                              const std::string& protected_artifact_path = {},
                              std::shared_ptr<spdlog::logger> logger     = {});
 

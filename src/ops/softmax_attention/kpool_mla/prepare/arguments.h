@@ -17,9 +17,18 @@ struct RawField {
     std::int64_t column_stride = 0, row_stride = 0;
 };
 
+struct PrepareWeight {
+    const void *codes = nullptr, *scales = nullptr;
+    QType format        = QType::BF16;
+    LinearPolicy policy = LinearPolicy::A16Only;
+    int rows            = 0;
+};
+
 struct PrepareArguments {
     const __nv_bfloat16* x;
-    const __nv_bfloat16* weight;
+    PrepareWeight weights[2];
+    KpoolMlaProjectionLayout mapping;
+    std::uint8_t *activation_codes, *activation_scales;
     const __nv_bfloat16 *latent_norm, *query_norm, *key_norm, *key_bias, *ape;
     const int *positions, *valid, *table_rows, *record_offsets;
     const std::int64_t* page_offsets;
@@ -36,10 +45,13 @@ struct PrepareArguments {
     int tokens, batch, rows, query_rank, heads, norm_dim;
     int splits = 1, stage_columns = 0;
     int first_row = 0, first_column = 0, first_span = 0, last_row = 0, last_stop = 0;
+    int first_pool_jobs = 0, pool_jobs_per_row = 0, middle_pool_jobs = 0, pool_jobs = 0;
     std::uint32_t token_multiplier = 0, token_shift = 0;
+    std::uint32_t pool_multiplier = 0, pool_shift = 0;
     float rms_epsilon, key_epsilon;
     bool update, fp8_index, fp8_latent;
 };
 
-void launch_prepare(const PrepareArguments& args, int window_columns, cudaStream_t stream);
+void launch_prepare(const PrepareArguments& args, const PrepareGeometry& geometry,
+                    int window_columns, cudaStream_t stream);
 } // namespace ninfer::ops::detail::kpool

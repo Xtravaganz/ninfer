@@ -16,11 +16,14 @@ PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
     return {identity.digests.at(frontier), frontier, identity.tag};
 }
 
-std::shared_ptr<const Identity> capture_identity(const Sequence& s) {
+std::shared_ptr<const Identity> capture_identity(const Sequence& s,
+                                                 context::MetadataBudget& budget) {
+    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
     auto out       = std::make_shared<Identity>(s.identity);
     const auto end = s.continuation.metadata.main_frontier;
     out->truncate(end);
-    return out;
+    const std::shared_ptr<const Identity> immutable = std::move(out);
+    return immutable->retention.retain(budget, immutable);
 }
 
 } // namespace ninfer::models::glm5next::detail
@@ -60,11 +63,6 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
     for (const auto id : input.token_ids)
         if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
-    std::uint32_t previous = 0;
-    for (const auto f : input.identity.execution_frontiers) {
-        if (f <= previous || f > count) throw std::invalid_argument("invalid execution frontier");
-        previous = f;
-    }
     if (const auto& r = input.identity.rewrite_checkpoint;
         r && (!r->recovery_frontier || r->recovery_frontier > r->frontier || r->frontier > count))
         throw std::invalid_argument("invalid input recovery point");
@@ -80,24 +78,30 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
     plan->identity =
         std::make_shared<detail::Identity>(input, static_cast<std::uint32_t>(p.shape.kv_storage));
     if (plan->reuse) {
-        const auto add = [&](std::uint32_t f, runtime::CheckpointRole role) {
+        const auto add = [&](std::uint32_t f, runtime::CheckpointRole role,
+                             SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
             if (!f || f > count) throw std::invalid_argument("invalid capture frontier");
             if (!plan->can_checkpoint(f)) return;
             auto found = std::find_if(plan->captures.begin(), plan->captures.end(),
                                       [&](const auto& c) { return c.frontier == f; });
             if (found == plan->captures.end()) {
-                plan->captures.push_back({f, {role}});
-            } else if (std::find(found->roles.begin(), found->roles.end(), role) ==
-                       found->roles.end())
-                found->roles.push_back(role);
+                plan->captures.push_back(
+                    {f, {role}, runtime::CheckpointOrigin::Semantic, evidence});
+            } else {
+                found->evidence |= evidence;
+                if (std::find(found->roles.begin(), found->roles.end(), role) == found->roles.end())
+                    found->roles.push_back(role);
+            }
         };
         add(input.identity.rewrite_checkpoint ? input.identity.rewrite_checkpoint->recovery_frontier
                                               : count,
             runtime::CheckpointRole::InputReplay);
         for (const auto& o : input.context_cache.opportunities)
-            add(o.frontier, o.kind == PromptCacheMarkerKind::PrivateLongAnchor
-                                ? runtime::CheckpointRole::LongAnchor
-                                : runtime::CheckpointRole::SharedPrefix);
+            add(o.frontier,
+                o.kind == PromptCacheMarkerKind::PrivateLongAnchor
+                    ? runtime::CheckpointRole::LongAnchor
+                    : runtime::CheckpointRole::SharedPrefix,
+                o.evidence);
         std::sort(plan->captures.begin(), plan->captures.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
     }

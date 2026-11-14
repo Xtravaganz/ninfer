@@ -25,6 +25,14 @@ int main() {
           "accepted/result/resolve/retire boundaries must partition one execution");
     ExecutionStatistics global{};
     accumulate(global, sample);
+    check(global[1].latency.bins.front() == 1,
+          "completed execution latency must be recorded once in a disjoint histogram bin");
+    ExecutionLatencyDistribution distribution;
+    distribution.observe(kExecutionLatencyBoundsNs[0]);
+    distribution.observe(kExecutionLatencyBoundsNs[0] + 1);
+    distribution.observe(kExecutionLatencyBoundsNs.back() + 1);
+    check(distribution.bins[0] == 1 && distribution.bins[1] == 1 && distribution.bins.back() == 1,
+          "latency histogram must preserve inclusive boundaries and overflow");
     RequestExecutionStatistics a{}, b{};
     for (auto* row : {&a, &b}) (*row)[1].observe(sample.latency);
     check(global[1].units == 1 && global[1].rows == 2 && global[1].scheduled_positions == 8 &&
@@ -50,13 +58,30 @@ int main() {
     request.expose_call(CoordinatorCall::Yield, 30, true);
     check(request.decode_host_exposed_ns == 35 && request.decode_scheduler_yield_exposed_ns == 30,
           "yield/relock latency is not host-active time or GPU time");
+    const HostExposureClock initial{};
+    const HostExposureClock first_end{{3, 5, 7}, {11, 13, 17, 19}};
+    const HostExposureClock batch_end{{30, 50, 70}, {110, 130, 170, 190}};
+    RequestHostTiming early, survivor;
+    auto first_output = early;
+    first_output.expose_since(initial, first_end, true);
+    check(early.decode_host_exposed_ns == 0 && first_output.decode_host_exposed_ns == 56,
+          "first-output exposure preview must not mutate pending counters");
+    early.expose_since(initial, first_end, true);
+    survivor.expose_since(initial, batch_end, false);
+    check(early.engine_commit_output_exposed_ns == 5 && early.decode_host_exposed_ns == 56 &&
+              early.decode_scheduler_yield_exposed_ns == 19 &&
+              survivor.engine_commit_output_exposed_ns == 50 &&
+              survivor.executor_flush_exposed_ns == 170 && survivor.decode_host_exposed_ns == 0,
+          "batch cleanup must preserve each completion cutoff and frozen decode membership");
     GpuExecutionObservation gpu;
     merge_gpu_intervals(gpu, {.result_stream_ns = 20, .prefill_stream_ns = 50});
-    merge_gpu_intervals(gpu, {.result_stream_ns = 30});
-    std::array<DurationCounter, 4> measured{};
+    merge_gpu_intervals(gpu,
+                        {.result_stream_ns = 30, .draft_stream_ns = 0, .target_stream_ns = 17});
+    GpuIntervalCounters measured{};
     accumulate_gpu(measured, gpu);
     check(measured[0].count == 1 && measured[0].total_ns == 30 && measured[1].count == 0 &&
-              measured[2].total_ns == 50,
+              measured[2].total_ns == 50 && measured[4].count == 1 && measured[4].total_ns == 0 &&
+              measured[5].total_ns == 17,
           "rank max is per execution; unavailable GPU intervals stay unmeasured");
     GenerationTransferTiming peer_timing;
     ContextTransferObservation peer{.direction   = ContextTransferDirection::PeerDeviceToDevice,

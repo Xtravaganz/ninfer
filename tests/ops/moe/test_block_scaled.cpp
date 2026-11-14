@@ -90,8 +90,7 @@ struct Matrix {
                 }
             } else {
                 auto p = quantized_weight::make_patterned_weight(
-                    QType::NVFP4, n, k, seed + slot,
-                    {.weight_scale_divisor = 1, .input_scale_divisor = 1});
+                    QType::NVFP4, n, k, seed + slot, {.weight_scale = 1, .input_scale = 1});
                 for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
                     p.payload[b] =
                         quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
@@ -137,12 +136,12 @@ struct Matrix {
 
     ExpertMatrixDeviceView view() const {
         ExpertMatrixDeviceView result;
-        result.codes           = static_cast<const std::byte*>(data.data());
-        result.scales          = result.codes + scale_offset;
-        result.offsets         = static_cast<const std::uint64_t*>(offsets.data());
-        result.indexed_storage = data.span();
-        result.divisors        = static_cast<const float*>(divisors.data());
-        result.divisor_stride  = fp8 ? 0 : 1;
+        result.codes               = static_cast<const std::byte*>(data.data());
+        result.scales              = result.codes + scale_offset;
+        result.offsets             = static_cast<const std::uint64_t*>(offsets.data());
+        result.indexed_storage     = data.span();
+        result.matrix_scales       = static_cast<const float*>(divisors.data());
+        result.matrix_scale_stride = fp8 ? 0 : 1;
         return result;
     }
 };
@@ -225,12 +224,18 @@ struct Fixture {
         control_d     = to_device_bf16(control);
         shared_gu_d   = to_device_bf16(shared_gu);
         shared_down_d = to_device_bf16(shared_down);
-        weights       = {dense(control_d, E + 1, H),
-                         {{gu.view(), down.view(), E, control_d.device()},
-                    fp8 ? ops::ExpertActivationDivisors{}
-                              : ops::ExpertActivationDivisors{719.7991333F, 313.927002F}},
-                         {{dense(shared_gu_d, 2 * shared_intermediate, H)},
-                          {dense(shared_down_d, H, shared_intermediate)}}};
+        weights       = {
+            dense(control_d, E + 1, H),
+            {{gu.view(), down.view(), E, control_d.device()},
+             fp8 ? ops::ExpertActivationCalibration{}
+                       : ops::ExpertActivationCalibration{ops::ActivationCalibrationView::broadcast(
+                                                        ops::ActivationScaleOperation::Divide,
+                                                        719.7991333F),
+                                                    ops::ActivationCalibrationView::broadcast(
+                                                        ops::ActivationScaleOperation::Divide,
+                                                        313.927002F)}},
+            {{dense(shared_gu_d, 2 * shared_intermediate, H)},
+                   {dense(shared_down_d, H, shared_intermediate)}}};
     }
 
     const std::vector<double>& expert(int p, int e, bool flip) {
@@ -250,7 +255,8 @@ struct Fixture {
 };
 
 int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKind kind,
-        bool shared, bool complete, DType dtype, ops::MoeEpilogue mode, bool graph) {
+        bool shared, bool complete, DType dtype, ops::MoeEpilogue mode, bool graph,
+        bool padded = false) {
     const auto& profile = f.profile;
     std::vector<float> x(std::size_t(tokens) * H), residual = random_values(x.size(), 906, .002F);
     std::vector<int> ids(tokens * TopK), mask(E);
@@ -273,12 +279,16 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
     GuardedDeviceBuffer scratch(bytes), result(x.size() * (dtype == DType::BF16 ? 2 : 4));
     MemoryArena arena(scratch.span());
     Tensor output(result.span(), dtype, {H, tokens});
+    std::vector<int> columns(padded ? tokens / 2 : 0);
+    DeviceBuffer valid(execution.device(), columns.size() * sizeof(int));
+    const ops::MoeTokenValidity validity{
+        padded ? Tensor(valid.span(), DType::I32, {int(columns.size())}) : Tensor{}, 2};
     auto invoke = [&] {
         if (complete) {
             auto weights = f.weights;
             if (kind == ops::ExpertSubsetKind::None) { weights.routed = {}; }
-            ops::topk_softmax_swiglu_moe(input, profile, weights, subset, mode, output, arena,
-                                         execution);
+            ops::topk_softmax_swiglu_moe(input, profile, weights, subset, mode, output, validity,
+                                         arena, execution);
         } else {
             const auto experts =
                 kind == ops::ExpertSubsetKind::None ? ops::CudaSwiGLUExperts{} : f.weights.routed;
@@ -308,6 +318,8 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
         kind == ops::ExpertSubsetKind::MaskOnes || kind == ops::ExpertSubsetKind::MaskZeros;
     const int replays = graph ? (masked ? 4 : 3) : 1;
     for (int replay = 0; replay < replays; ++replay) {
+        for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + replay) % 3;
+        if (padded) valid.copy_from_host(columns.data(), valid.size());
         const bool flip = replay == 2;
         for (int e = 0; e < E; ++e) {
             mask[e] = replay == 3 ? int(kind == ops::ExpertSubsetKind::MaskZeros)
@@ -318,6 +330,17 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
         for (int t = 0; t < tokens; ++t) {
             const int p = (t + replay) % 3;
             std::copy(f.x[p].begin(), f.x[p].end(), x.begin() + std::size_t(t) * H);
+            if (padded && t % 2 >= columns[t / 2]) {
+                for (int j = 0; j < TopK; ++j) {
+                    ids[t * TopK + j]   = -1;
+                    alpha[t * TopK + j] = 0;
+                }
+                beta[t] = 0;
+                if (mode == ops::MoeEpilogue::AddResidual)
+                    for (int h = 0; h < H; ++h)
+                        ref[std::size_t(t) * H + h] = residual[std::size_t(t) * H + h];
+                continue;
+            }
             std::vector<int> order(E);
             std::iota(order.begin(), order.end(), 0);
             const auto& logits = f.logits[p];
@@ -389,6 +412,17 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
             const auto values = from_device<float>(output.data, x.size());
             actual.assign(values.begin(), values.end());
         }
+        if (padded)
+            for (int t = 0; t < tokens; ++t) {
+                if (t % 2 < columns[t / 2]) continue;
+                for (int h = 0; h < H; ++h) {
+                    const auto i        = std::size_t(t) * H + h;
+                    const auto expected = mode == ops::MoeEpilogue::AddResidual
+                                              ? double(bf16_to_f32(f32_to_bf16(residual[i])))
+                                              : 0;
+                    if (actual[i] != expected) ++failures;
+                }
+            }
         const std::string label =
             std::string(complete ? "complete" : "routed") + (f.fp8 ? " fp8 M=" : " nvfp4 M=") +
             std::to_string(tokens) + " subset=" + std::to_string(int(kind)) +
@@ -431,7 +465,7 @@ int route_cases(Fixture& f, CudaExecutionView execution) {
             cudaGraphExec_t executable;
             cuda_check(cudaStreamBeginCapture(execution.stream(), cudaStreamCaptureModeGlobal),
                        "capture route");
-            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, arena,
+            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, {}, arena,
                                     execution);
             cuda_check(cudaStreamEndCapture(execution.stream(), &graph), "end route capture");
             cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
@@ -449,7 +483,7 @@ int route_cases(Fixture& f, CudaExecutionView execution) {
             cuda_check(cudaGraphExecDestroy(executable), "destroy route exec");
             cuda_check(cudaGraphDestroy(graph), "destroy route graph");
         } else {
-            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, arena,
+            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, {}, arena,
                                     execution);
             cuda_synchronize(execution.stream());
         }
@@ -601,8 +635,8 @@ void add_shared320_cases(OpSuite& suite, bool fp8) {
         Tensor x(dx.span(), DType::BF16, {H, 1}), y(result.span(), DType::BF16, {H, 1});
         MemoryArena arena(scratch.span());
         try {
-            ops::topk_softmax_swiglu_moe(x, profile, f.weights, {}, MoeEpilogue::Write, y, arena,
-                                         execution);
+            ops::topk_softmax_swiglu_moe(x, profile, f.weights, {}, MoeEpilogue::Write, y, {},
+                                         arena, execution);
         } catch (const std::invalid_argument&) { return 0; }
         return 1;
     });
@@ -650,6 +684,18 @@ int main(int argc, char** argv) {
             runners.push_back(run);
         };
         special("affine", affine_cases);
+        special("validity",
+                [](Fixture& f, auto e) {
+                    int failures = 0;
+                    for (auto mode : {ops::MoeEpilogue::Write, ops::MoeEpilogue::AddResidual})
+                        failures += run(f, e, 18, ops::ExpertSubsetKind::All, true, true,
+                                        DType::BF16, mode, true, true);
+                    for (int t : {2, 130})
+                        failures += run(f, e, t, ops::ExpertSubsetKind::MaskZeros, false, false,
+                                        DType::FP32, ops::MoeEpilogue::Write, true, true);
+                    return failures;
+                },
+                {{"execution", "graph"}, {"suite", "concurrency"}});
         if (!fp8) special("route", route_cases, {{"execution", "graph"}});
         const auto add = [&](int m, ops::ExpertSubsetKind subset, bool shared, bool complete,
                              DType dtype, ops::MoeEpilogue epilogue, bool graph) {

@@ -19,7 +19,16 @@ namespace {
 int verify(kp::SparseMlaFixture& f) {
     const bool fp8   = f.cache.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const auto words = f.output.download();
-    std::vector<double> got, reference;
+    std::vector<double> got, reference, key_values, value_values;
+    if (f.key_encoded) {
+        key_values.resize(16384 * 512);
+        value_values.resize(16384 * 512);
+        for (int r = 0; r < 16384; ++r)
+            for (int d = 0; d < 512; ++d) {
+                key_values[r * 512 + d]   = represented_weight(*f.key_encoded, r, d);
+                value_values[r * 512 + d] = represented_weight(*f.value_encoded, r, d);
+            }
+    }
     for (int b = 0; b < f.B; ++b)
         for (int t = 0; t < f.T; ++t) {
             const auto tokens        = f.selected_tokens(t, b);
@@ -41,8 +50,11 @@ int verify(kp::SparseMlaFixture& f) {
                             : kp::decode(f.latent[physical * 512 + d]));
             }
             const auto result =
-                mla_reference_values(f.query.host.data() + offset, f.key_up.host.data(),
-                                     f.value_up.host.data(), values, f.scale);
+                f.key_encoded
+                    ? mla_reference_values(f.query.host.data() + offset, key_values.data(),
+                                           value_values.data(), values, f.scale)
+                    : mla_reference_values(f.query.host.data() + offset, f.key_up.host.data(),
+                                           f.value_up.host.data(), values, f.scale);
             reference.insert(reference.end(), result.begin(), result.end());
             for (int i = 0; i < 64 * 256; ++i) got.push_back(kp::decode(words[offset + i]));
         }
@@ -63,17 +75,19 @@ int verify(kp::SparseMlaFixture& f) {
         const auto scales = f.packed->download_plane(f.scale_plane_index);
         failures += std::memcmp(scales.data(), f.latent_scales.data(), scales.size()) != 0;
     }
+    if (f.key_encoded) failures += !f.key_encoded->unchanged() || !f.value_encoded->unchanged();
     failures += !f.output.guards() || !f.scratch_guards() || !f.packed->guards_intact();
     failures += f.workspace->used() != 0 || f.workspace->peak_used() > f.workspace_bytes;
     return failures;
 }
 
 int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = false,
-        float magnitude = 1, bool fp8 = false, bool unequal = false) {
+        float magnitude = 1, bool fp8 = false, bool unequal = false, bool mx = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), T, B, E, cap, 11, ragged, frozen, magnitude, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                                : ops::KpoolMlaStorage::BFloat16);
+    if (mx) f.encode_factors(d.execution_view());
     if (unequal) {
         constexpr float scales[]{.25F, 2.F, .5F, 1.F};
         for (std::size_t i = 0; i < f.latent.size(); ++i)
@@ -86,6 +100,95 @@ int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = f
     f.launch(d.execution_view());
     d.synchronize();
     return verify(f);
+}
+
+int token_sweep(bool fp8, bool mx) {
+    auto& d = cuda_environment().context;
+    const std::vector<int> tokens{1, 3, 8, 17};
+    kp::SparseMlaFixture f(d.execution_view(), 17, 2, 8192, 512, 1, true, false, 1, 1,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, 0, tokens);
+    if (mx) f.encode_factors(d.execution_view());
+    int failures = 0;
+    for (int t : {17, 1, 8, 3, 17}) {
+        f.reset_tokens(t, 512, true, false, 1, d.execution_view());
+        f.launch(d.execution_view());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
+int decode_padding_graph(bool mx, int tokens = 4) {
+    auto& d = cuda_environment().context;
+    kp::SparseMlaFixture f(d.execution_view(), tokens, 5, 8195, 512, 11, false, false, 1, 1,
+                           ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
+                           KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0);
+    if (mx) f.encode_factors(d.execution_view());
+    const auto positions = f.positions.host, valid = f.valid.host, selectors = f.selectors.host,
+               rows = f.selection_rows.host;
+    DecodeGraphDefinition definition;
+    definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int active : {5, 3, 0, 1, 5}) {
+        f.positions.host      = positions;
+        f.valid.host          = valid;
+        f.selectors.host      = selectors;
+        f.selection_rows.host = rows;
+        for (int b = active; b < f.B; ++b) {
+            f.valid.at(b)     = 0;
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < f.T; ++t) {
+                f.positions.at(t, b)      = -1;
+                f.selection_rows.at(t, b) = -1;
+            }
+        }
+        f.upload_metadata();
+        f.scratch.fill(0xa5);
+        graph.launch(d.stream());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
+int large_batch_graph(int B, int T, bool fp8, bool mx) {
+    auto& d = cuda_environment().context;
+    kp::SparseMlaFixture f(d.execution_view(), T, B, 65, 1, 1, false, false, 1, 1,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16);
+    if (mx) f.encode_factors(d.execution_view());
+    const auto positions = f.positions.host, valid = f.valid.host, selectors = f.selectors.host,
+               rows = f.selection_rows.host;
+    DecodeGraphDefinition definition;
+    definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (bool active : {true, false}) {
+        f.positions.host      = positions;
+        f.valid.host          = valid;
+        f.selectors.host      = selectors;
+        f.selection_rows.host = rows;
+        for (int b = 0; b < B; ++b) {
+            if (active && (b == 0 || b == B / 2 || b == B - 1)) continue;
+            f.valid.at(b)     = 0;
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < T; ++t) {
+                f.positions.at(t, b)      = -1;
+                f.selection_rows.at(t, b) = -1;
+            }
+        }
+        f.upload_metadata();
+        f.scratch.fill(0xa5);
+        graph.launch(d.stream());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
 }
 
 int empty(bool fp8 = false) {
@@ -127,11 +230,12 @@ int shared_envelope() {
     return verify(f);
 }
 
-int graph(bool fp8 = false) {
+int graph(bool fp8 = false, bool mx = false, int tokens = 65) {
     auto& d = cuda_environment().context;
-    kp::SparseMlaFixture f(d.execution_view(), 65, 3, 1048576, 3, 1, true, false, 1, 1,
+    kp::SparseMlaFixture f(d.execution_view(), tokens, 3, 1048576, 3, 1, true, false, 1, 1,
                            fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                                : ops::KpoolMlaStorage::BFloat16);
+    if (mx) f.encode_factors(d.execution_view());
     DecodeGraphDefinition outer;
     DecodeGraphExecutable executable;
     DecodeGraphChild child;
@@ -154,7 +258,7 @@ int graph(bool fp8 = false) {
         }
         f.upload_metadata();
         const auto profile = ops::kpool_sparse_mla_graph_profile(
-            {64, 256, 256, 512}, f.cache.storage, f.envelope, f.B, f.T,
+            ops::kpool_sparse_mla_profile(f.factors(), 64), f.cache.storage, f.envelope, f.B, f.T,
             d.execution_view().multiprocessor_count());
         if (!installed || *installed != profile) {
             DecodeGraphDefinition definition;
@@ -276,10 +380,12 @@ int read_footprint(bool fp8 = false) {
     return verify(f);
 }
 
-int workspace_interval(bool fp8 = false) {
+int workspace_interval(bool fp8 = false, bool mx = false) {
     const auto capacity = [=](int B, int lo, int hi, unsigned E) {
+        auto profile       = ops::KpoolSparseMlaProfile{64, 256, 256, 512};
+        profile.key_format = profile.value_format = mx ? QType::MXFP8 : QType::BF16;
         return ops::kpool_sparse_mla_workspace_capacity_bytes(
-            {64, 256, 256, 512},
+            profile,
             fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16,
             {E}, B, lo, hi, 48);
     };
@@ -291,6 +397,11 @@ int workspace_interval(bool fp8 = false) {
                 for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, E));
                 failures += capacity(B, lo, hi, E) != maximum;
             }
+    for (auto [B, lo, hi] : {std::tuple{17, 1, 65}, {65, 9, 31}, {1025, 1, 17}}) {
+        std::size_t maximum = 0;
+        for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, 8192));
+        failures += capacity(B, lo, hi, 8192) != maximum;
+    }
     return failures;
 }
 
@@ -325,6 +436,11 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (bool fp8 : {false, true})
+        for (bool mx : {false, true})
+            suite.add("kpool_sparse_mla/token_sweep/" + std::to_string(fp8) + "/" +
+                          std::to_string(mx),
+                      [=] { return token_sweep(fp8, mx); });
     const auto add = [&](std::string id, std::function<int()> run, bool graph = false) {
         suite.add(std::move(id), std::move(run),
                   {{"format", "bf16"}, {"execution", graph ? "graph" : "eager"}});
@@ -381,6 +497,12 @@ int main(int argc, char** argv) {
     add("kpool_sparse_mla/read_footprint", [] { return read_footprint(); });
     suite.add("kpool_sparse_mla/workspace_interval", [] { return workspace_interval(); });
     suite.add("kpool_sparse_mla/admission", admission);
+    suite.add("kpool_sparse_mla/large_batch/bf16",
+              [] { return large_batch_graph(17, 1, false, false); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/large_batch/mxfp8_fp8_window",
+              [] { return large_batch_graph(129, 9, true, true); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
     for (auto [T, B, E, cap] :
          {std::tuple{1, 1, 1, 512}, {1, 1, 2, 512},        {1, 1, 3, 512},     {1, 1, 65, 512},
           {1, 1, 2051, 512},        {1, 1, 1048576, 512},  {4, 2, 8194, 512},  {9, 1, 2051, 512},
@@ -396,6 +518,18 @@ int main(int argc, char** argv) {
                   [=] { return run(1, 1, 8195, 512, false, false, magnitude, true, true); },
                   {{"format", "fp8"}});
     suite.add("kpool_sparse_mla/fp8/empty", [] { return empty(true); }, {{"format", "fp8"}});
+    suite.add("kpool_sparse_mla/fp8/decode_padding_graph",
+              [] { return decode_padding_graph(false); },
+              {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/mxfp8/fp8/decode_padding_graph",
+              [] { return decode_padding_graph(true); },
+              {{"format", "mxfp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/fp8/decode_padding_graph_t3",
+              [] { return decode_padding_graph(false, 3); },
+              {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/mxfp8/fp8/decode_padding_graph_t3",
+              [] { return decode_padding_graph(true, 3); },
+              {{"format", "mxfp8"}, {"execution", "graph"}});
     suite.add("kpool_sparse_mla/fp8/shared_envelope", shared_envelope,
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_sparse_mla/fp8/graph", [] { return graph(true); },
@@ -410,5 +544,33 @@ int main(int argc, char** argv) {
               {{"format", "fp8"}});
     suite.add("kpool_sparse_mla/fp8/workspace_interval", [] { return workspace_interval(true); },
               {{"format", "fp8"}});
+    for (bool fp8 : {false, true}) {
+        const auto prefix = std::string("kpool_sparse_mla/mxfp8/") + (fp8 ? "fp8/" : "bf16/");
+        for (auto [T, B, E] : {std::tuple{1, 1, 1},
+                               {1, 1, 2051},
+                               {8, 1, 8195},
+                               {33, 1, 8195},
+                               {65, 1, 8195},
+                               {7, 7, 8195}})
+            suite.add(prefix + std::to_string(T) + "x" + std::to_string(B) + "/" +
+                          std::to_string(E),
+                      [=] { return run(T, B, E, 17, B > 1, false, 1, fp8, false, true); },
+                      {{"format", "mxfp8"}});
+        suite.add(prefix + "workspace_interval", [=] { return workspace_interval(fp8, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "merge_full_selection",
+                  [=] { return run(18, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "small_full_selection",
+                  [=] { return run(8, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "small_graph", [=] { return graph(fp8, true, 2); },
+                  {{"format", "mxfp8"}, {"execution", "graph"}});
+        suite.add(prefix + "full_selection",
+                  [=] { return run(32, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "graph", [=] { return graph(fp8, true, 17); },
+                  {{"format", "mxfp8"}, {"execution", "graph"}});
+    }
     return suite.main(argc, argv);
 }

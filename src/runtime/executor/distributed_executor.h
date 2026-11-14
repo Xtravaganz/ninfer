@@ -23,24 +23,36 @@ public:
     using Commit = typename Types::Commit;
 
     DistributedExecutor(std::unique_ptr<distributed::ExecutionGroup> group,
-                        ExecutionCapacity capacity, Codec codec,
+                        ExecutionCapacity capacity, Codec codec, std::uint32_t max_decode_rows,
                         std::vector<RankSnapshot> initial_observations = {})
-        : group_(std::move(group)), pool_(capacity), codec_(std::move(codec)),
+        : Executor<Types>(max_decode_rows), group_(std::move(group)), pool_(capacity),
+          codec_(std::move(codec)), budget_(codec_.control_budget()),
           compute_(capacity.compute_frames), context_(capacity.context_frames),
           progress_(group_->topology().ranks.size()), measurement_reports_(progress_.size()),
           measurement_errors_(progress_.size()) {
-        validate_control_capacity();
         this->observations_.resize(progress_.size());
         if (!initial_observations.empty()) this->observations_ = std::move(initial_observations);
+        const auto model_budget = budget_;
         for (const auto& rank : group_->topology().ranks) {
             this->observations_[rank.rank].rank = rank.rank;
             this->observations_[rank.rank].node = rank.node;
+            const auto& observed                = this->observations_[rank.rank];
+            budget_.report                      = std::max(
+                budget_.report,
+                protocol::with_communication_capacity(model_budget, observed.communication).report);
+            this->rank_descriptions_.push_back(
+                {rank.rank, rank.node, rank.device, observed.hardware,
+                 observed.physical_memory && observed.physical_memory->shared_physical_memory,
+                 rank.tp, rank.ep, rank.dp, rank.pp, rank.adp});
             // Runtime communication counters start at activation, after preparation and capture.
-            for (auto& counters : this->observations_[rank.rank].communication) {
-                counters.eager = {};
-                counters.graph = {};
-            }
+            for (auto& group : this->observations_[rank.rank].communication)
+                for (auto& backend : group.backends) {
+                    backend.eager = {};
+                    backend.graph = {};
+                }
         }
+        group_->reserve_control_capacity(
+            protocol::control_transport_limits(budget_, pool_.capacity(), progress_.size(), true));
     }
 
     ~DistributedExecutor() override {
@@ -177,6 +189,7 @@ public:
                     snapshot.communication_eager = previous.communication_eager;
                     snapshot.communication_graph = previous.communication_graph;
                     snapshot.compute_paths       = previous.compute_paths;
+                    snapshot.attention           = previous.attention;
                     merge_host_observations(snapshot.host, previous.host);
                     auto& memory                         = snapshot.memory;
                     const auto& old                      = previous.memory;
@@ -214,7 +227,7 @@ public:
                 }
                 if (message.kind == distributed::wire::Kind::MeasurementComplete) {
                     if (message.payload.size() >
-                        protocol::measurement_report_capacity(codec_.control_budget().report))
+                        protocol::measurement_report_capacity(budget_.report))
                         throw std::logic_error(
                             "rank resource report exceeded its prepared capacity");
                     if (!measurement_query_ || in.u64() != measurement_query_ ||
@@ -230,6 +243,7 @@ public:
                     updated.communication_eager = previous.communication_eager;
                     updated.communication_graph = previous.communication_graph;
                     updated.compute_paths       = previous.compute_paths;
+                    updated.attention           = previous.attention;
                     merge_host_observations(updated.host, previous.host);
                     previous                                        = std::move(updated);
                     this->observations_[incoming->peer].received_ns = observation_time_ns();
@@ -239,7 +253,7 @@ public:
                 }
                 if (message.kind != distributed::wire::Kind::Event)
                     throw std::logic_error("unexpected runtime control message");
-                if (message.payload.size() > codec_.control_budget().event)
+                if (message.payload.size() > budget_.event)
                     throw std::logic_error("rank event exceeded its prepared capacity");
                 auto event = protocol::decode_event<Types>(in, codec_);
                 in.finish();
@@ -304,6 +318,19 @@ public:
     [[nodiscard]] bool failed() const noexcept override { return failed_; }
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
+
+    void observe_in_flight(std::vector<ExecutionProgress>& out) const override {
+        for (const auto* flights : {&compute_, &context_})
+            for (const auto& flight : *flights) {
+                if (flight.phase == Phase::Empty) continue;
+                const auto stage = flight.phase == Phase::Decision     ? ExecutionStage::Decision
+                                   : flight.phase == Phase::Result     ? ExecutionStage::ResultReady
+                                   : flight.phase == Phase::Retiring   ? ExecutionStage::Retiring
+                                   : flight.phase == Phase::Discarding ? ExecutionStage::Discarding
+                                                                       : ExecutionStage::Submitted;
+                out.push_back(flight.clock.progress(flight.ticket.id, stage));
+            }
+    }
 
     void measure(MeasurementCommand command) override {
         require_available();
@@ -393,11 +420,6 @@ private:
         }
     }
 
-    void validate_control_capacity() const {
-        protocol::validate_control_capacity(codec_.control_budget(), pool_.capacity(),
-                                            group_->limits(), group_->topology().ranks.size());
-    }
-
     void measurement_boundary(MeasurementCommand command) {
         require_available();
         std::fill(measurement_reports_.begin(), measurement_reports_.end(), false);
@@ -451,12 +473,11 @@ private:
             distributed::wire::Encoder out;
             protocol::encode(out, envelope);
             if (envelope.scope.contains(rank.rank)) encode_body(out, rank.rank);
-            auto payload      = std::move(out).take();
-            const auto budget = codec_.control_budget();
+            auto payload = std::move(out).take();
             const auto limit =
                 kind == distributed::wire::Kind::Submit
-                    ? budget.work(envelope.ticket.frame.kind)
-                    : (kind == distributed::wire::Kind::Supply ? budget.decision : budget.commit);
+                    ? budget_.work(envelope.ticket.frame.kind)
+                    : (kind == distributed::wire::Kind::Supply ? budget_.decision : budget_.commit);
             if (payload.size() > limit)
                 throw std::logic_error("rank " + std::to_string(rank.rank) + " message " +
                                        std::to_string(static_cast<unsigned>(kind)) + " encoded " +
@@ -557,7 +578,7 @@ private:
                                 throw std::logic_error("context retired before publication");
                             auto observed         = f.clock.finish(observation_time_ns());
                             observed.max_rank_gpu = f.gpu;
-                            accumulate(this->execution_statistics_, observed);
+                            this->observe_execution(observed);
                             events_.emplace_back(DeviceRetired{f.ticket, f.command, {}, observed});
                             retire_inputs(*f.work);
                             pool_.retire(f.ticket.frame);
@@ -572,6 +593,7 @@ private:
     std::unique_ptr<distributed::ExecutionGroup> group_;
     ExecutionPool pool_;
     Codec codec_;
+    protocol::ControlBudget budget_;
     InputTransfers inputs_;
     std::vector<Flight> compute_, context_;
 

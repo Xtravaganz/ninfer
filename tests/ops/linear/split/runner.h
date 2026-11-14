@@ -30,6 +30,7 @@ struct Profile {
     double a4_absolute = 1.0 / 256.0;
     Binding binding    = Binding::Direct;
     std::vector<int> input_slices;
+    bool bias = false;
 };
 
 struct Invocation {
@@ -47,10 +48,12 @@ struct Invocation {
     bool eager_before_capture  = false;
     bool validate_operands     = false;
     bool workspace_intervals   = false;
+    int token_axis             = 0; // Check zero-copy [D,H,T,B] with this T and B=t/T.
     std::string id;
 };
 
 void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> calls);
+void add_preparation_cases(Suite& suite);
 void add_segmented_cases(Suite& suite);
 void add_two_output_cases(Suite& suite);
 void add_multi_output_cases(Suite& suite);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/quant/nvfp4.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_layout.h"
@@ -27,11 +29,15 @@ __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int 
            (group - group_tile * kGroupsPerTile);
 }
 
-template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, class Input = __nv_bfloat16>
+template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, class Input = __nv_bfloat16,
+          bool Programmatic = false>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kernel(
     const Input* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
-    float input_scale_divisor) {
+    float input_scale) {
+    if constexpr (Programmatic) {
+        if (threadIdx.x == 0) pdl::trigger_dependents();
+    }
     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
     static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);
@@ -58,8 +64,7 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     const int token                           = task / kGroupsPerRow;
     const int group                           = task - token * kGroupsPerRow;
     const common::Nvfp4QuantizedK16 quantized = common::quantize_nvfp4_k16(
-        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
-        input_scale_divisor);
+        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16, input_scale);
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     common::store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));

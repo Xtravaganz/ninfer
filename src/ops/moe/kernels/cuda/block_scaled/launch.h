@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/moe.h"
+#include "ops/moe/kernels/cuda/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/schedule.h"
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
@@ -39,12 +40,13 @@ struct Plan {
 
     int pool_min_experts = 0, pool_expert_limit = 0, pool_columns = 0;
     int pool_row_window = 0, pool_queued_ctas_per_sm = 0;
+    int pool_token_threshold = 0;
 
     Nvfp4Tuning nvfp4;
     std::optional<Nvfp4Tuning> nvfp4_down;
     Fp8LoadTuning fp8;
     int group_columns = 0, small_expert_limit = 0;
-    Nvfp4LoadSchedule medium, dense;
+    Nvfp4LoadSchedule medium, large, dense;
 
     int job_columns() const {
         int columns = gate_columns > down_columns ? gate_columns : down_columns;
@@ -78,6 +80,7 @@ struct Storage {
     float* routed_sum           = nullptr;
     void* shared_activation     = nullptr;
     Groups groups{};
+    TokenValidity token_validity;
 };
 
 struct Preparation {
@@ -95,7 +98,8 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
                            ExpertSubset subset, const Tensor& shared, float* scores,
-                           const Storage& storage, const Plan& plan, CudaExecutionView execution);
+                           const Storage& storage, const Plan& plan, TokenValidity validity,
+                           CudaExecutionView execution);
 
 // Overwrites job_experts/job_columns after GU has finished on the same stream.
 // Counts, offsets, packed assignments and all quantized payloads remain unchanged.

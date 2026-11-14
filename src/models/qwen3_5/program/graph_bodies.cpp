@@ -14,9 +14,10 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         return initialize_graphs(GraphPreparationMode::Capture);
     }
     GraphPreparation observation(device, mode);
-    graphs.emplace(GraphSpec{capacity, max_concurrency, draft_window, backend});
+    graphs.emplace(GraphSpec{capacity, batch_execution, draft_window, backend});
     GraphBodies bodies;
-    bodies.prologue = [this](const GraphInvocation& call) {
+    bodies.prologue = [this, capture = observation.capturing()](const GraphInvocation& call) {
+        gpu_timer.begin_target(capture);
         if (call.phase != GraphPhase::Verify && !resources.dflash) upload_ingress();
     };
     bodies.text = [this](const GraphInvocation& call) {
@@ -31,6 +32,8 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
                                      frame.state_source_offsets.slice(0, 0, batch),
                                      frame.state_destination_offsets.slice(0, 0, batch),
                                      {}};
+        for (int row = 0; row < batch; ++row)
+            inputs.active_tokens += frame.host_ingress.valid_columns[row];
         execution::TextStateUpdate update = execution::StepUpdate{};
         if (call.width > 1) update.emplace<execution::ReplayRecords>(*resources.replay_records);
         std::optional<execution::DFlashFeatureSink> feature;
@@ -46,10 +49,12 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
                                          resources.moe.get()},
             std::move(inputs), update, call.envelope, input.hidden, feature ? &*feature : nullptr);
     };
-    bodies.project = [this](const GraphInvocation& call) {
+    bodies.project = [this, capture = observation.capturing()](const GraphInvocation& call) {
         project_decode(call.batch, call.width);
+        gpu_timer.end_target(capture);
     };
-    bodies.draft = [this](const GraphInvocation& call) {
+    bodies.draft = [this, capture = observation.capturing()](const GraphInvocation& call) {
+        gpu_timer.begin_draft(capture);
         if (backend == SpeculativeBackend::Mtp) {
             upload_ingress();
             run_mtp_draft(call.batch, draft_window, std::max(1U, call.profile.max));
@@ -57,6 +62,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             append_draft_history(call.batch, {0, draft_window + 1});
             run_dflash_draft(call.batch, 0, call.profile.max);
         }
+        gpu_timer.end_draft(capture);
     };
     bodies.decision = [this](const GraphInvocation& call) {
         decide_decode(call.batch, call.width);

@@ -10,6 +10,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const distributed::ExecutionTopology& topology)
     : rank_(rank.rank), ranks_(topology.ranks.size()),
       contract_{rank.shape,
+                std::make_shared<const BatchExecutionPlan>(rank.batches),
                 definition.config().text.vocabulary,
                 definition.resources().text.public_token_count,
                 ranks_,
@@ -22,21 +23,13 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     const auto ranks = topology.ranks.size(), pools = rank.context.pools.size();
     const auto payloads = contract_.payload_capacity(ranks);
     const auto width    = std::size_t(rank.shape.draft_tokens) + 1;
-    wire::Encoder observed;
-    RankExecutionObservation sample;
-    sample.gpu = {0, 0, 0, 0};
-    runtime::protocol::encode(observed, sample);
     const auto event =
-        std::move(observed).take().size() + 128 +
+        runtime::protocol::rank_execution_observation_capacity() + 128 +
         std::max<std::size_t>({batch * (24 + 4 * width), 4ULL * rank.shape.prefill_chunk,
                                64ULL * 5 * (pools + 1) * ranks});
     auto snapshot = rank.observation;
     snapshot.physical_memory.emplace();
     snapshot.communication.clear();
-    for (const auto& group : topology.groups)
-        if (std::find(group.members.begin(), group.members.end(), rank.rank) != group.members.end())
-            snapshot.communication.push_back(
-                {group.id, static_cast<std::uint32_t>(group.members.size())});
     wire::Encoder report;
     runtime::protocol::encode(report, snapshot);
     budget_ = {payloads.compute_work,

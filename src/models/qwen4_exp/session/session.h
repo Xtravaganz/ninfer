@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/context/recovery_value.h"
+
 #include "models/common/context/checkpoint_store.h"
 #include "models/common/context/directory.h"
 #include "models/common/context/recovery.h"
@@ -10,6 +12,8 @@
 #include "runtime/executor/executor.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/placement.h"
+
+#include <compare>
 
 namespace ninfer::models::qwen4_exp {
 class Session;
@@ -40,7 +44,7 @@ using CheckpointHandle = context::CheckpointHandle;
 struct PrefixShortlistKey {
     std::array<std::uint64_t, 2> digests{};
     std::uint32_t frontier = 0, identity_tag = 0;
-    friend bool operator==(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
+    friend auto operator<=>(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
 };
 
 class RequestBasePlan {
@@ -63,6 +67,7 @@ struct CheckpointMetadata {
     runtime::CheckpointRole role     = runtime::CheckpointRole::Continuation;
     bool leased                      = false;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     runtime::PlacementId placement;
 };
 
@@ -168,7 +173,7 @@ private:
     std::vector<std::int32_t> counts_;
     std::uint32_t stride_ = 1;
     bool decode_          = false;
-    std::array<bool, kMaximumConcurrency> failed_{};
+    std::vector<std::uint8_t> failed_;
     ExecutionSample execution_;
     friend class detail::SessionImpl;
     friend class Session;
@@ -186,12 +191,11 @@ struct PrefillProgress {
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     SpeculativeStats speculative;
+    bool capture_ready = false;
 };
 
 struct CommitResult {
-    std::array<CommitRowResult, kMaximumConcurrency> rows{};
-    std::array<bool, kMaximumConcurrency> capture_ready{};
-    std::size_t row_count = 0;
+    std::vector<CommitRowResult> rows;
 };
 
 struct DiscardResult {
@@ -214,6 +218,7 @@ struct ReplayProgress {
     bool capture_ready             = false;
     std::uint32_t processed_tokens = 0;
     bool complete                  = false;
+    std::uint32_t frontier         = 0;
 };
 
 struct CapturePreparation {
@@ -222,6 +227,7 @@ struct CapturePreparation {
     ContextAssessment assessment;
     context::HostWriteRequirements host;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     std::vector<CheckpointHandle> retired_points;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause, Maintenance };
@@ -232,7 +238,7 @@ struct ContextProgress {
     std::optional<SequenceHandle> sequence;
     std::optional<runtime::ResidencyId> residency;
     std::optional<ResumeState> paused;
-    bool replaying = false;
+    RecoveryProgress recovery;
     std::vector<CheckpointHandle> private_points, retired_checkpoints, captured_checkpoints;
     std::vector<runtime::ContextTransferObservation> transfers;
     runtime::ContextOperationCounts operations;
@@ -275,6 +281,25 @@ private:
 
 class Session {
 public:
+    using RecoveryPoint    = runtime::RecoveryPoint<CheckpointHandle>;
+    using RecoveryAccount  = context::MetadataAccount;
+    using RecoveryTopology = context::RecoveryIndex<runtime::RecoveryHandle>;
+    [[nodiscard]] context::MetadataBudget& recovery_budget() const;
+    [[nodiscard]] runtime::CaptureCostQuote
+        capture_cost(SequenceHandle, std::uint32_t,
+                     runtime::CaptureStorage = runtime::CaptureStorage::Automatic) const;
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+    maintenance_work(const ContextAssessment&) const;
+    [[nodiscard]] std::vector<RecoveryPoint>
+    recovery_points(const ContextReleaseSet& removed_device    = {},
+                    std::span<const CheckpointHandle> selected = {}) const;
+    // Target quotes are scoped to their request/base plan. Unlike checkpoint identities,
+    // they never extend that backing beyond its existing request lifetime.
+    [[nodiscard]] std::shared_ptr<const runtime::RecoveryDescription>
+    recovery_target(const RequestBasePlan&, std::uint32_t, runtime::PlacementId,
+                    runtime::CaptureStorage = runtime::CaptureStorage::Device) const;
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+    demotion_work(const ContextDemotion&, std::span<const CheckpointHandle> victims = {}) const;
     [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
     void yield_prefill(SequenceHandle);
 
@@ -290,6 +315,10 @@ public:
                                                const ContextAssessment&) const;
     [[nodiscard]] std::uint64_t useful_release_bytes(const ContextReleaseSet&,
                                                      const ContextAssessment&) const;
+    [[nodiscard]] std::vector<std::uint64_t> release_limits(const ContextAssessment&) const;
+    [[nodiscard]] runtime::ContextReleaseMeasure release_measure(const ContextReleaseSet&,
+                                                                 const ContextAssessment&) const;
+    // Deferred/Stale schedule no work; the caller owns retry and its cost receipt.
     [[nodiscard]] runtime::ContextStart start_maintenance(const ContextAssessment&);
 
     Session(PreparedSession&&, runtime::Executor<ExecutionTypes>&);
@@ -300,6 +329,7 @@ public:
     [[nodiscard]] std::span<const runtime::KvPoolDescriptor> kv_pools() const noexcept;
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPrompt&&,
                                                const runtime::ResolvedExecutionOptions&);
+    [[nodiscard]] std::vector<PlacementDescriptor> placement_descriptions() const;
     [[nodiscard]] std::span<const runtime::PlacementId> placements(const RequestBasePlan&) const;
     [[nodiscard]] runtime::PlacementId placement(SequenceHandle) const;
     [[nodiscard]] std::uint64_t load_tokens(SequenceHandle) const;
@@ -316,7 +346,8 @@ public:
     checkpoint_recovery_frontier(CheckpointHandle, const RequestBasePlan&, std::uint32_t) const;
     [[nodiscard]] context::RecoveryEvaluation<>
         evaluate_recovery(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] std::size_t checkpoint_capacity() const noexcept;
+    [[nodiscard]] std::size_t checkpoint_extent() const noexcept;
+    [[nodiscard]] std::uint64_t checkpoint_catalog_revision() const noexcept;
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
         checkpoint_restore_requirements(CheckpointHandle) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;
@@ -324,11 +355,14 @@ public:
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle>) const;
     using HostRequirement = context::HostWriteRequirements;
+    [[nodiscard]] runtime::PauseCostQuote
+    pause_cost(SequenceHandle, const PauseOption&, std::span<const CheckpointHandle> sources,
+               std::span<const CheckpointHandle> victims = {}) const;
     [[nodiscard]] std::vector<PauseOption> pause_options(SequenceHandle) const;
     [[nodiscard]] bool pause_contributes(SequenceHandle, const PauseOption&,
                                          const ContextAssessment&) const;
     [[nodiscard]] bool prepare_pause(SequenceHandle, runtime::PauseAction,
-                                     std::span<const CheckpointHandle> host_victims = {});
+                                     std::span<const CheckpointHandle> victims = {});
     [[nodiscard]] HostRequirement demotion_host_requirements(const ContextDemotion&) const;
     // Combine disjoint quotes from one synchronous reclaim plan; start_demote revalidates them.
     [[nodiscard]] ContextDemotion combine_demotions(std::span<const ContextDemotion>) const;
@@ -349,12 +383,16 @@ public:
                                                    const SourceCandidate&, ResumeState* = nullptr,
                                                    ExecutionUnitKind    = ExecutionUnitKind::Decode,
                                                    std::uint32_t tokens = 1);
-    [[nodiscard]] bool start_capture(SequenceHandle);
+    [[nodiscard]] runtime::ContextStart start_capture(SequenceHandle);
+    [[nodiscard]] bool retry_capture(SequenceHandle);
+    [[nodiscard]] std::vector<CheckpointHandle> share_capture(SequenceHandle, CheckpointHandle);
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] bool capture_is_shared(SequenceHandle) const;
-    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle) const;
+    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle, std::uint32_t begin,
+                                                               std::uint32_t end) const;
     [[nodiscard]] std::optional<CapturePreparation>
-    prepare_capture(SequenceHandle, std::span<const CheckpointHandle> host_victims = {});
+    prepare_capture(SequenceHandle, std::span<const CheckpointHandle> victims = {},
+                    runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
     void skip_capture(SequenceHandle,
                       runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
@@ -364,7 +402,7 @@ public:
     plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
                   const ContextDemand&) const;
     [[nodiscard]] runtime::ContextStart
-    start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims = {});
+    start_demote(const ContextDemotion&, std::span<const CheckpointHandle> victims = {});
     [[nodiscard]] bool start_pause(SequenceHandle, runtime::PauseAction);
     [[nodiscard]] bool has_context_operation() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
@@ -377,10 +415,9 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const bool> constrained = {});
+                 std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride,
-                  std::span<const std::optional<std::uint32_t>> splits);
+    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPrompt&&,
                                                                       std::uint32_t first_target);
     [[nodiscard]] std::optional<SessionEvent> poll();

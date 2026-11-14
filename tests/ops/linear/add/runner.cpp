@@ -145,8 +145,8 @@ HostWeight make_weight(QType format, const InvocationCase& shape) {
     }
     quantized_weight::PatternedWeightOptions options;
     if (format == QType::NVFP4) {
-        options.weight_scale_divisor = 0.125F;
-        options.input_scale_divisor  = 3.5F;
+        options.weight_scale = 0.125F;
+        options.input_scale  = 3.5F;
     } else if (format != QType::FP8_E4M3FN_ROW_BF16) {
         options.row_split_scale = (format == QType::Q4_G64_FP16 || format == QType::Q5_G64_FP16)
                                       ? quantized_weight::RowSplitScalePattern::Small
@@ -335,10 +335,21 @@ static int run_cases(std::string_view label, QType format, const InvocationCase&
                 ? ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k,
                                                            *invocation.policy, t, t)
                 : ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
+        auto interval_capacity = ops::linear_add_workspace_capacity_bytes(
+            qtype, shape.n, shape.k, invocation.policy.value_or(ops::LinearPolicy::A16Only), 1,
+            maximum_t);
         for (auto policy : {invocation.graph_policy, invocation.followup_policy}) {
-            if (policy)
+            if (policy) {
                 capacity = std::max(capacity, ops::linear_add_workspace_capacity_bytes(
                                                   qtype, shape.n, shape.k, *policy, t, t));
+                interval_capacity = std::max(interval_capacity,
+                                             ops::linear_add_workspace_capacity_bytes(
+                                                 qtype, shape.n, shape.k, *policy, 1, maximum_t));
+            }
+        }
+        if (capacity > interval_capacity) {
+            std::cerr << invocation.id << ": interval workspace misses execution capacity\n";
+            ++failures;
         }
         GuardedDeviceBuffer scratch(capacity);
         MemoryArena workspace(scratch.span());

@@ -1,15 +1,20 @@
 #include "models/glm5next/session/session.h"
 #include "models/glm5next/session/internal.h"
 #include "models/glm5next/startup.h"
+#include "models/glm5next/runtime_types.h"
+#include "runtime/engine/engine_core.h"
 #include "runtime/executor/execution_pool.h"
 #include "core/platform.h"
 #if NINFER_ENABLE_DISTRIBUTED
 #    include "models/glm5next/wire.h"
 #endif
+#include <atomic>
 #include <deque>
 #include <iostream>
 #include <fstream>
+#include <map>
 #include <sstream>
+#include <thread>
 
 namespace {
 using namespace ninfer;
@@ -32,12 +37,25 @@ public:
     std::uint64_t next      = 0;
     std::size_t peer_copies = 0;
     bool failure            = false;
+    std::atomic<bool> hold_poll{false};
+    std::atomic<bool> fail_poll{false};
+    std::uint32_t hold_prefill_frontier = UINT32_MAX;
+    std::uint64_t unit_time_ns          = 0;
+    unsigned defer_binding = 0, bindings = 0;
+    std::optional<rt::DeviceRetired> deferred_context;
+    bool compute_retired = false;
+    std::function<void()> replay_submitted;
     std::vector<std::uint32_t> accept;
     glm::ComputeResult computed;
 
-    explicit Executor(glm::WorkContract c) : contract(c) {}
+    explicit Executor(glm::WorkContract c)
+        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {}
+
+    void observe_sample(const ExecutionSample& sample) { observe_execution(sample); }
 
     void bind_to_current_thread() override {}
+
+    void observe_in_flight(std::vector<ExecutionProgress>&) const override {}
 
     rt::SessionEpoch epoch() const noexcept override { return {1}; }
 
@@ -72,13 +90,17 @@ public:
             for (const auto& action : actions.operations)
                 peer_copies += std::holds_alternative<ctx::PeerCopy>(action);
         last = std::move(work);
-        if (std::holds_alternative<glm::ContextWork>(last.operation)) {
+        if (const auto* context = std::get_if<glm::ContextWork>(&last.operation)) {
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, glm::ContextResult{}});
-            events.emplace_back(rt::DeviceRetired{ticket, {next}, {}});
+            const rt::DeviceRetired retired{ticket, {next}, {}};
+            if (!context->bindings.empty() && ++bindings == defer_binding)
+                deferred_context = retired;
+            else
+                events.emplace_back(retired);
         } else {
             glm::ComputeResult result;
             const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
-            const auto* mtp     = std::get_if<glm::MtpWork>(&last.operation);
+            const auto* mtp     = std::get_if<glm::SpeculativeWork>(&last.operation);
             const auto rows     = glm::work_rows(last);
             for (std::size_t b = 0; b < rows.size(); ++b) {
                 const auto& row = rows[b];
@@ -93,8 +115,13 @@ public:
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
                 result.rows.push_back(std::move(r));
             }
+            if (forward && forward->kind == glm::ForwardKind::Replay && replay_submitted)
+                replay_submitted();
             computed = result;
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, std::move(result)});
+            if (forward && forward->kind == glm::ForwardKind::Prefill &&
+                rows.front().main_frontier >= hold_prefill_frontier)
+                hold_poll = true;
         }
         return ticket;
     }
@@ -115,17 +142,33 @@ public:
     }
 
     std::optional<rt::ExecutionEvent<glm::ExecutionTypes>> poll() override {
-        if (events.empty()) return {};
+        if (pool.in_flight() && fail_poll.exchange(false))
+            throw std::runtime_error("injected executor polling failure");
+        if (hold_poll || events.empty()) return {};
         auto e = std::move(events.front());
         events.pop_front();
-        if (auto* retired = std::get_if<rt::DeviceRetired>(&e)) pool.retire(retired->ticket.frame);
+        if (auto* retired = std::get_if<rt::DeviceRetired>(&e)) {
+            if (deferred_context && retired->ticket.frame.kind == rt::FrameKind::Compute)
+                compute_retired = true;
+            pool.retire(retired->ticket.frame);
+            retired->execution.latency.total_ns = unit_time_ns;
+        }
         return e;
     }
 
-    void flush() override {}
+    void flush() override {
+        // Model an asynchronous binding retiring after resident compute has progressed.
+        // Publishing at flush keeps the new lane unavailable until the next scheduling boundary.
+        if (deferred_context && compute_retired) {
+            events.emplace_back(std::move(*deferred_context));
+            deferred_context.reset();
+            compute_retired = false;
+        }
+    }
 
     void drain() override {
         events.clear();
+        deferred_context.reset();
         pool.retire_submitted();
     }
 
@@ -138,23 +181,38 @@ public:
     void measure(rt::MeasurementCommand) override {}
 };
 
-glm::SessionPlan plan(const glm::ModelDefinition& definition) {
+glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false,
+                      std::uint32_t concurrency = 3) {
     glm::SessionPlan p;
-    p.shape                  = {256,
-                                3,
-                                64,
-               definition.options().mtp() ? 3U : 0U,
-                                KvCacheStorage::BFloat16,
-                                KvCacheVectorFormat::BFloat16,
-                                EnginePurpose::Generation,
-                                true,
-                                false};
+    p.shape   = {.max_context     = 256,
+                 .max_concurrency = concurrency,
+                 .prefill_chunk   = 64,
+                 .draft_tokens =
+                   definition.options().speculative != SpeculativeBackend::None ? 3U : 0U,
+                 .kv_storage    = KvCacheStorage::BFloat16,
+                 .index_format  = KvCacheVectorFormat::BFloat16,
+                 .purpose       = EnginePurpose::Generation,
+                 .context_cache = true,
+                 .gpu_timing    = false,
+                 .speculative   = definition.options().speculative};
+    p.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(p.shape.max_concurrency, 2, true));
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
     profile->local.size      = 2;
     profile->local.kda_heads = {0, c.kda.heads / 2};
     if (definition.options().mtp()) profile->mtp.emplace();
+    if (definition.options().masked_draft()) {
+        const auto& draft                = *profile->config.draft;
+        profile->draft.emplace().context = {glm::dimension(c.hidden),
+                                            glm::dimension(draft.attention.head_dim),
+                                            glm::dimension(draft.attention.num_key_value_heads / 2),
+                                            draft.sliding_window.value(),
+                                            QType::BF16,
+                                            draft.rms_norm_eps,
+                                            draft.rope_theta};
+    }
     const auto state = glm::describe_state(glm::plan_state(*profile));
     p.states         = {state, state};
     p.caches.push_back(
@@ -177,7 +235,7 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
                                .logical_pages = 512,
                                .histories     = 256,
                                .page_capacity = 4,
-                               .table_rows    = 3,
+                               .table_rows    = concurrency,
                                .parts         = {{0, {page.page_bytes, page.alignment}},
                                                  {1, {page.page_bytes, page.alignment}}}});
     if (definition.options().mtp()) {
@@ -191,11 +249,65 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
         for (auto& part : pool.parts) part.record = {p.caches[1].page_bytes, p.caches[1].alignment};
         p.context.pools.push_back(std::move(pool));
     }
-    const auto records              = p.context.state.logical_capacity * 8ULL;
-    p.context.metadata_budget_bytes = ctx::ContextDirectory::metadata_bytes(p.context) +
-                                      glm::detail::Checkpoints::metadata_bytes(records) +
-                                      ctx::RecoveryIndex<>::metadata_bytes(records);
+    if (pressure)
+        for (auto& pool : p.context.pools) pool.logical_pages = 4;
+    const auto records = p.context.state.logical_capacity * 8ULL;
+    p.context.metadata_budget_bytes =
+        ctx::ContextDirectory::metadata_bytes(p.context) +
+        glm::detail::Checkpoints::metadata_bytes(records) +
+        ctx::RecoveryIndex<>::metadata_bytes(records) +
+        ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, 2, 2) +
+        glm::InputIdentity::cache_bytes(p.shape.max_context, p.shape.max_concurrency);
     return p;
+}
+
+void batch_geometry() {
+    Executor executor({.shape = {.max_concurrency = 128}});
+    executor.observe_sample({.work    = {ExecutionKind::Decode, 128, 128, 512},
+                             .latency = {.result_ns = 11, .retirement_ns = 3, .total_ns = 14}});
+    const auto statistics = executor.decode_statistics();
+    require(statistics.size() == 128 && statistics.back().units == 1 &&
+                statistics.back().rows == 128 && statistics.back().scheduled_positions == 512 &&
+                statistics.back().exposure.total.total_ns == 14 && statistics.front().units == 0,
+            "executor decode counters do not preserve high-concurrency samples");
+    const models::BatchExecutionPlan plan(models::make_batch_execution_spec(256, 3, true));
+    std::vector<glm::WorkRow> rows(17);
+    for (std::size_t i = 0; i < rows.size(); ++i) rows[i].attention_rank = i % 3;
+    const auto physical = glm::plan_batch(rows, plan, true);
+    require(physical.shape == models::PhysicalBatchShape{20, 6} && physical.members.size() == 17 &&
+                physical.owners.size() == 3,
+            "ADP row catalog cannot represent padded global rows beyond owner slots");
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t owner = 0; owner < 3; ++owner)
+        for (std::uint32_t row = 0; row < rows.size(); ++row)
+            if (rows[row].attention_rank == owner) expected.push_back(row);
+    require(physical.members == expected, "owner grouping changed logical member order");
+#if NINFER_ENABLE_DISTRIBUTED
+    glm::ForwardWork operation;
+    operation.rows  = rows;
+    operation.batch = physical;
+    const glm::Work work{{}, std::move(operation)};
+    distributed::wire::Encoder encoded;
+    glm::encode_work(encoded, work, 0);
+    const auto bytes = std::move(encoded).take();
+    distributed::wire::Decoder decoder(bytes);
+    const auto decoded = glm::decode_work(decoder);
+    decoder.finish();
+    require(glm::work_batch(decoded) == physical && glm::work_rows(decoded).size() == 17,
+            "wire lost frozen physical shape or added padded members");
+#endif
+
+    require(glm::plan_batch(rows, plan, false).shape == models::PhysicalBatchShape{17, 6},
+            "non-decode work was padded by the graph policy");
+    for (const auto shape : plan.graph_shapes()) {
+        const auto owners = plan.representative_owners(shape);
+        rows.clear();
+        for (std::uint32_t owner = 0; owner < owners.size(); ++owner)
+            for (std::uint32_t n = 0; n < owners[owner]; ++n)
+                rows.emplace_back().attention_rank = owner;
+        require(glm::plan_batch(rows, plan, true).shape == shape,
+                "graph witness cannot reproduce its frozen physical geometry");
+    }
 }
 
 glm::Frontend make_frontend() {
@@ -218,15 +330,23 @@ struct Fixture {
     glm::Frontend frontend;
     glm::SessionPlan layout;
     Executor executor;
+    ctx::ContextDirectory* directory = nullptr;
     glm::Session session;
 
-    explicit Fixture(std::shared_ptr<const glm::ModelDefinition> d)
-        : definition(d), frontend(make_frontend()), layout(plan(*d)),
-          executor({layout.shape, d->config().text.vocabulary,
+    explicit Fixture(std::shared_ptr<const glm::ModelDefinition> d, bool pressure = false)
+        : Fixture(d, plan(*d, pressure)) {}
+
+    Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
+        : definition(d), frontend(make_frontend()), layout(std::move(p)),
+          executor({layout.shape, layout.batches, d->config().text.vocabulary,
                     d->resources().text.public_token_count, 2}),
-          session(glm::prepare_session(d, layout,
-                                       std::make_unique<ctx::ContextDirectory>(layout.context)),
-                  executor) {}
+          session(glm::prepare_session(d, layout, make_directory()), executor) {}
+
+    std::unique_ptr<ctx::ContextDirectory> make_directory() {
+        auto result = std::make_unique<ctx::ContextDirectory>(layout.context);
+        directory   = result.get();
+        return result;
+    }
 
     glm::RequestBasePlan request(unsigned n) {
         rt::ResolvedExecutionOptions o;
@@ -287,6 +407,450 @@ struct Fixture {
     }
 };
 
+void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition, plan(*definition, false, 17));
+    const auto input = f.request(4);
+    std::vector<glm::SequenceHandle> members;
+    for (std::uint32_t lane = 0; lane < 17; ++lane) {
+        members.push_back(f.bind(input, lane, 0));
+        f.commit(f.prefill(members.back()));
+    }
+    for (const auto count : {10U, 9U, 17U}) {
+        f.executor.accept.resize(count);
+        std::vector<glm::ExecutionUnit> units;
+        std::vector<rt::RoundBudget> budgets;
+        std::vector<glm::SequenceHandle> ordered;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            f.executor.accept[i] = i % 2;
+            const auto h         = members[(i + 5) % members.size()];
+            const auto budget    = 1U + i % 4;
+            ordered.push_back(h);
+            units.push_back({h, glm::ExecutionUnitKind::Decode, budget});
+            budgets.push_back({budget});
+        }
+        require(bool(f.session.reserve_units(units)), "expanded decode reservation failed");
+        require(f.session.start_decode(ordered, budgets).has_value(),
+                "expanded decode not started");
+        const auto& physical = glm::work_batch(f.executor.last);
+        require(physical.shape.rows == (count == 17 ? 17 : 10) &&
+                    physical.owners[0].size == count && physical.owners[1].size == 0 &&
+                    physical.members.size() == count,
+                "expanded work lost real membership or invented empty-rank rows");
+        auto pending = f.event<glm::PendingBatch>();
+        std::vector<rt::CommitDecision> decisions(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            require(f.session.execution_pending(ordered[i]), "submitted membership disappeared");
+            decisions[i].accepted_tokens = pending.row_counts()[i];
+        }
+        decisions[2]       = {.terminal = true, .cancelled = true};
+        const auto retired = ordered[2];
+        (void)f.session.commit(std::move(pending), decisions);
+        require(f.session.execution_pending(retired),
+                "cancelled member released before retirement");
+        f.idle();
+        require(f.session.abort(retired).status != rt::ConsumeStatus::Consumed &&
+                    !f.session.execution_pending(retired),
+                "retired member remained resident");
+        const auto lane = 7U;
+        members[lane]   = f.bind(input, lane, 0);
+        f.commit(f.prefill(members[lane]));
+        require(f.session.abort(retired).status != rt::ConsumeStatus::Consumed,
+                "lane reuse revived a stale identity");
+    }
+    for (auto h : members) (void)f.session.abort(h);
+    f.idle();
+    require(f.session.physical_usage().state_objects == 0, "expanded membership retained State");
+}
+
+struct CopyWork {
+    std::uint64_t bytes = 0, operations = 0, images = 0, pages = 0;
+    bool operator==(const CopyWork&) const = default;
+};
+
+using LocalCopies = std::map<std::pair<std::uint32_t, std::size_t>, CopyWork>;
+
+LocalCopies local_copies(std::span<const rt::ContextTransferRequirement> requirements) {
+    LocalCopies result;
+    for (const auto& copy : requirements) {
+        require(copy.direction == rt::ContextTransferDirection::DeviceToDevice && !copy.peer,
+                "local quote unexpectedly uses another transfer route");
+        auto& work = result[{copy.rank, copy.resource.index()}];
+        work.bytes += copy.work.payload_bytes;
+        work.operations += copy.work.copy_operations;
+        work.images += copy.image_count;
+        work.pages += copy.page_groups;
+    }
+    return result;
+}
+
+LocalCopies local_copies(const glm::Work& submitted) {
+    LocalCopies result;
+    for (const auto& [rank, actions] : submitted.actions)
+        for (const auto& action : actions.operations) {
+            require(!std::holds_alternative<ctx::PeerCopy>(action),
+                    "local recovery submitted a peer copy");
+            if (const auto* copy = std::get_if<ctx::RecordCopy>(&action)) {
+                require(copy->source.memory == ctx::ContextMemory::Device &&
+                            copy->destination.memory == ctx::ContextMemory::Device,
+                        "local recovery submitted a Host copy");
+                auto& work = result[{rank, copy->resource.index()}];
+                work.bytes += copy->source.bytes;
+                ++work.operations;
+                work.images += copy->image_count;
+                work.pages += copy->page_groups;
+            }
+        }
+    return result;
+}
+
+void recovery_quotes_match_tail_copies(std::shared_ptr<const glm::ModelDefinition> definition) {
+    for (auto frontier : {4U, 64U}) {
+        Fixture f(definition);
+        auto request    = f.request(frontier);
+        const auto seed = f.bind(request, 0, 0);
+        f.commit(f.prefill(seed), true);
+        const auto finished = f.session.finish(seed);
+        require(finished.checkpoint.has_value(), "tail-copy seed did not publish");
+        f.idle();
+        auto longer = f.request(frontier + 4);
+        // One live writer owns the source's tail. A second replay must acquire its own copy.
+        const auto writer   = f.bind(longer, 1, 0, finished.checkpoint);
+        const auto points   = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        const auto& restore = points.front().description->restores.front();
+        require(restore.placement.value == 0 && restore.transfers.empty(),
+                "same-frontier recovery was charged for future KV writes");
+        const auto target = f.session.recovery_target(longer, frontier + 4, {0});
+        require(points.front().description->identity->prefix_of(*target->identity) &&
+                    target->identity->rebuild(frontier).tokens == 4,
+                "tail-copy test did not describe a later recovery target");
+        const auto candidate =
+            f.session.inspect_source(longer, finished.checkpoint, false, {}, {}, {0});
+        require(candidate.has_value(), "tail-copy replay source was rejected");
+        const auto replay    = f.bind(longer, 2, 0, finished.checkpoint);
+        const auto submitted = local_copies(f.executor.last);
+        require(local_copies(restore.replay_transfers) == submitted &&
+                    local_copies(candidate->transfers) == submitted,
+                "Native recovery/source quote omitted the submitted KV tail copy");
+        const auto expected = frontier % kPagedKVPageSize   ? f.layout.caches.size()
+                              : definition->options().mtp() ? 1U
+                                                            : 0U;
+        require(submitted.size() == expected,
+                "tail quotation ignored the Main/MTP page-boundary difference");
+        for (const auto& [key, work] : submitted)
+            require(key.first == 0 && key.second > 0 && work.operations == 1 && work.pages == 1 &&
+                        work.images == 0 && work.bytes != 0,
+                    "recovery comparison did not observe a KV page copy");
+        require(f.session.abort(writer).status == rt::ConsumeStatus::Consumed,
+                "tail-copy writer did not retire");
+        f.idle();
+        require(f.session.abort(replay).status == rt::ConsumeStatus::Consumed,
+                "tail-copy replay did not retire");
+        f.idle();
+        const auto idle_points = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        require(idle_points.front().description->restores.front().replay_transfers.empty(),
+                "retired writer remained in a refreshed recovery quote");
+        require(f.session.release_checkpoint(*finished.checkpoint),
+                "tail-copy seed did not retire");
+    }
+}
+
+void pause_quotes_match_shared_draft(std::shared_ptr<const glm::ModelDefinition> definition) {
+    for (auto sharing : {0U, 1U, 2U}) {
+        Fixture f(definition);
+        auto request  = f.request(4);
+        auto sequence = f.bind(request, 0, 0);
+        f.commit(f.prefill(sequence), sharing != 0);
+        std::optional<glm::CheckpointHandle> source;
+        if (sharing) {
+            source = f.session.finish(sequence).checkpoint;
+            require(source.has_value(), "draft pause seed did not publish");
+            f.idle();
+            sequence = f.bind(request, 1, 0, source);
+        }
+        const auto options = f.session.pause_options(sequence);
+        const auto keep    = std::find_if(options.begin(), options.end(), [](const auto& option) {
+            return option.action.kind == rt::PauseKind::KeepDevice;
+        });
+        require(keep != options.end(), "draft pause has no KeepDevice option");
+        std::vector<glm::CheckpointHandle> victims;
+        if (sharing == 2) victims.push_back(*source);
+        const auto quote = f.session.pause_cost(sequence, *keep, {}, victims);
+        require(quote.recovery.size() == 1 && !quote.recovery.front().rebuild.tokens &&
+                    !quote.unpriced_work,
+                "complete draft snapshot unexpectedly requires replay");
+        require(f.session.prepare_pause(sequence, keep->action, victims),
+                "draft KeepDevice preflight failed");
+        if (!victims.empty()) {
+            require(f.session.release_checkpoint(*source), "draft pause victim did not retire");
+            source.reset();
+        }
+        require(f.session.start_pause(sequence, keep->action), "draft KeepDevice did not start");
+        auto paused = f.event<glm::ContextProgress>();
+        f.idle();
+        require(paused.paused && paused.paused->has_snapshot(), "draft pause lost its snapshot");
+        const auto resumed =
+            f.bind(request, 1, 0, paused.paused->snapshot_handle(), &*paused.paused);
+        const auto submitted = local_copies(f.executor.last);
+        require(local_copies(quote.recovery.front().transfers) == submitted,
+                "KeepDevice recovery quote differs from submitted draft State copies");
+        require(submitted.size() == (sharing == 1 ? f.layout.states.size() : 0),
+                "KeepDevice quote failed to distinguish Move from shared-State Fork");
+        for (const auto& [key, work] : submitted)
+            require(key.second == 0 && work.images == 1 && work.operations == 1 &&
+                        work.pages == 0 &&
+                        work.bytes == f.layout.states[key.first].draft_context->bytes,
+                    "KeepDevice comparison did not observe a draft State field copy");
+        require(f.session.abort(resumed).status == rt::ConsumeStatus::Consumed,
+                "resumed draft did not retire");
+        f.idle();
+        if (source) require(f.session.release_checkpoint(*source), "draft seed did not retire");
+    }
+}
+
+void identity_budget_replacement(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout                  = plan(*definition);
+    layout.shape.max_concurrency = 1;
+    layout.batches               = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(1, 2, true));
+    Fixture f(definition, std::move(layout));
+    const auto request  = f.request(220);
+    const auto sequence = f.bind(request, 0, 0);
+    std::vector<glm::CheckpointHandle> input;
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 64};
+        require(bool(f.session.reserve_units({&unit, 1})), "long input could not reserve prefill");
+        const auto capture = f.session.prepare_capture(sequence);
+        require(f.session.start_prefill(sequence).has_value(), "long input prefill did not start");
+        auto progress = f.event<glm::PrefillProgress>();
+        f.idle();
+        if (capture) {
+            require(capture->reserved && progress.capture_ready && !progress.pending,
+                    "long input capture was not prepared before execution");
+            require(f.session.start_capture(sequence) == rt::ContextStart::Started,
+                    "long input capture did not start");
+            auto captured = f.event<glm::ContextProgress>();
+            input         = std::move(captured.captured_checkpoints);
+            f.idle();
+            break;
+        }
+        require(!progress.pending, "long input skipped its configured checkpoint");
+    }
+    require(!input.empty(), "long input identity was not retained");
+    f.commit(f.prefill(sequence), true);
+    const auto finished = f.session.finish(sequence);
+    require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
+            "long retained input prevented preparation of its continuation identity");
+    require(f.session.release_checkpoint(*finished.checkpoint), "long continuation did not retire");
+    for (auto h : input) require(f.session.release_checkpoint(h), "long input did not retire");
+}
+
+void identity_budget_retirement(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    std::vector<std::shared_ptr<const rt::RecoveryIdentity>> retained;
+    bool exhausted = false;
+    for (unsigned i = 0; i < 32; ++i) {
+        const auto request  = f.request(128);
+        const auto sequence = f.bind(request, 0, 0);
+        f.commit(f.prefill(sequence), true);
+        const auto finished = f.session.finish(sequence);
+        require(finished.status == rt::ConsumeStatus::Consumed,
+                "identity pressure prevented a legal request from finishing");
+        f.idle();
+        if (!finished.checkpoint) {
+            exhausted = true;
+            break;
+        }
+        const auto points = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        require(points.size() == 1, "finished checkpoint has no recovery identity");
+        retained.push_back(points.front().description->identity);
+        require(f.session.release_checkpoint(*finished.checkpoint),
+                "retained quote prevented physical checkpoint retirement");
+    }
+    require(exhausted && !retained.empty(), "retired identity bytes escaped their finite pool");
+    const auto usage = f.session.physical_usage();
+    require(!usage.state_objects && !usage.history_objects,
+            "refused optional continuation retained native storage");
+
+    const auto request  = f.request(256);
+    const auto sequence = f.bind(request, 0, 0);
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 64};
+        require(bool(f.session.reserve_units({&unit, 1})),
+                "identity cache pressure prevented necessary prefill");
+        const auto capture = f.session.prepare_capture(sequence);
+        require(!capture, "full identity cache accepted a new long capture");
+        require(f.session.start_prefill(sequence).has_value(), "identity pressure stalled prefill");
+        auto progress = f.event<glm::PrefillProgress>();
+        if (progress.pending)
+            f.commit(std::move(*progress.pending));
+        else
+            f.idle();
+    }
+    require(!f.session.prepare_pause(sequence, {rt::PauseKind::KeepDevice, {0}}),
+            "full identity cache prepared another pause snapshot");
+    const rt::PauseAction replay{rt::PauseKind::ReleaseAndReplay, {0}};
+    require(f.session.prepare_pause(sequence, replay) && f.session.start_pause(sequence, replay),
+            "full identity cache blocked the no-snapshot pause path");
+    auto paused = f.event<glm::ContextProgress>();
+    f.idle();
+    require(paused.paused && !paused.paused->has_snapshot(),
+            "identity-pressure fallback did not release and replay");
+
+    retained.clear();
+    const auto fresh   = f.request(128);
+    const auto resumed = f.bind(fresh, 0, 0);
+    f.commit(f.prefill(resumed), true);
+    const auto finished = f.session.finish(resumed);
+    require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
+            "retired decision identities did not return optional-save capacity");
+    require(f.session.release_checkpoint(*finished.checkpoint),
+            "replacement identity checkpoint failed to retire");
+}
+
+void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout = plan(*definition);
+    // Pad the toy State images to reproduce production's large-State/small-KV geometry.
+    for (auto& variant : layout.context.state.layouts)
+        for (auto& part : variant.parts) part.image_bytes *= 4;
+    Fixture f(definition, std::move(layout));
+    const auto sequence = f.bind(f.request(4), 0, 1);
+    const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&unit, 1})), "fragmented capture input reservation");
+
+    auto& records     = f.directory->records();
+    auto& pool        = records.pool({1, ctx::ContextMemory::Device});
+    const auto usage  = pool.usage();
+    const auto state  = f.layout.context.state.layouts[1].parts[1];
+    const auto filler = f.layout.context.pools[0].parts[1].record;
+    const auto state_class =
+        std::find_if(usage.classes.begin(), usage.classes.end(), [&](const auto& c) {
+            return c.spec == RecordSpec{state.image_bytes, state.alignment};
+        });
+    const auto filler_class = std::find_if(usage.classes.begin(), usage.classes.end(),
+                                           [&](const auto& c) { return c.spec == filler; });
+    require(state_class != usage.classes.end() && filler_class != usage.classes.end() &&
+                state_class != filler_class && filler_class->records_per_block >= 2,
+            "fragmentation fixture needs distinct State and page classes");
+
+    auto occupy = [&](std::uint32_t layout, std::uint32_t count) {
+        std::vector<ctx::RecordLease> result;
+        auto reserved =
+            records.reserve(ctx::RecordDemand{layout, ctx::ContextMemory::Device, count, {1}});
+        require(reserved && reserved->ready(), "fragmentation fixture capacity");
+        for (std::uint32_t i = 0; i < count; ++i) result.push_back(reserved->materialize(1));
+        return result;
+    };
+    auto state_fill = occupy(ctx::state_record_layout(1), state_class->free_records);
+    const auto count =
+        usage.free_block_bytes / usage.block_bytes * filler_class->records_per_block +
+        filler_class->free_records;
+    auto fillers = occupy(1, count);
+    for (auto& record : fillers)
+        if ((record.binding().offset % usage.block_bytes / filler_class->stride) % 2 == 0)
+            record.reset();
+
+    const auto prepared = f.session.prepare_capture(sequence);
+    require(prepared && !prepared->reserved && prepared->assessment.requires_maintenance(),
+            "capture returned a wait on its own discarded reservation");
+    require(!pool.has_maintenance() && !f.session.has_context_operation(),
+            "failed capture retained an unsubmitted maintenance plan");
+    auto held_context = f.executor.pool.try_reserve(rt::FrameKind::Context);
+    require(held_context.has_value() &&
+                f.session.start_maintenance(prepared->assessment) == rt::ContextStart::Deferred,
+            "maintenance did not defer without its frame");
+    held_context.reset();
+    require(!f.session.poll() && !f.session.has_context_operation(),
+            "deferred maintenance escaped its caller's retry/cost decision");
+    require(f.session.start_maintenance(prepared->assessment) == rt::ContextStart::Started,
+            "capture did not start the required compaction");
+    const auto maintained = f.event<glm::ContextProgress>();
+    require(maintained.kind == glm::ContextOperationKind::Maintenance && maintained.published,
+            "compaction did not publish");
+    f.idle();
+    const auto ready = f.session.prepare_capture(sequence);
+    require(ready && ready->reserved, "capture did not become ready after compaction");
+    require(f.session.start_prefill(sequence).has_value(), "compacted prefill did not execute");
+    require(f.event<glm::PrefillProgress>().capture_ready,
+            "compacted prefill lost its checkpoint boundary");
+    f.idle();
+    require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
+            "compacted checkpoint did not start");
+    const auto captured = f.event<glm::ContextProgress>();
+    require(captured.published && !captured.captured_checkpoints.empty(),
+            "compacted checkpoint did not publish");
+    f.idle();
+    require(f.session.abort(sequence).status == rt::ConsumeStatus::Consumed,
+            "compacted request did not cancel");
+    f.idle();
+    for (const auto checkpoint : captured.captured_checkpoints)
+        require(f.session.release_checkpoint(checkpoint), "compacted checkpoint retained readers");
+    fillers.clear();
+    state_fill.clear();
+    const auto final = f.session.physical_usage();
+    require(!final.state_objects && !final.history_objects &&
+                std::all_of(final.pools.begin(), final.pools.end(),
+                            [](const auto& p) {
+                                return !p.live_bytes && !p.reserved_bytes &&
+                                       !p.pending_retirement_bytes && !p.future_reserved_bytes;
+                            }),
+            "compacted capture retained State, history or reservations");
+}
+
+void relocation_preflight_includes_destination_victims(
+    std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(4);
+    const auto donor   = f.bind(request, 0, 0);
+    f.commit(f.prefill(donor), true);
+    const auto done = f.session.finish(donor);
+    require(done.checkpoint.has_value(), "relocation victim was not published");
+    f.idle();
+    const auto active = f.bind(request, 1, 1);
+    f.commit(f.prefill(active));
+    auto options      = f.session.pause_options(active);
+    const auto option = std::find_if(options.begin(), options.end(), [](const auto& value) {
+        return value.action.kind == rt::PauseKind::Relocate && value.action.placement.value == 0;
+    });
+    require(option != options.end(), "native relocation option is absent");
+    std::vector<ctx::RecordLease> fillers;
+    for (;;) {
+        auto record = f.directory->records().reserve(
+            ctx::RecordDemand{ctx::state_record_layout(0), ctx::ContextMemory::Device, 1, {0}});
+        if (!record || !record->ready()) break;
+        fillers.push_back(record->materialize(0));
+    }
+    const std::array victims{*done.checkpoint};
+    const auto plan  = f.session.plan_releases(victims, {}, option->demand);
+    auto released    = plan.inventory->select();
+    const auto trial = released.probe(victims);
+    require(!f.session.assess(option->demand).feasible() &&
+                f.session.assess(option->demand, released.released()).feasible(),
+            "destination pressure did not require exactly the quoted victim");
+    auto frame = f.executor.pool.try_reserve(rt::FrameKind::Context);
+    require(frame && !f.session.prepare_pause(active, option->action, victims) &&
+                f.session.valid_checkpoint(victims.front()),
+            "failed pause preflight consumed its destination victim");
+    frame.reset();
+    require(f.session.prepare_pause(active, option->action, victims) &&
+                f.session.valid_checkpoint(victims.front()),
+            "native relocation did not prepare against the complete release set");
+    require(f.session.release_checkpoint(victims.front()), "prepared victim did not retire");
+    require(f.session.start_pause(active, option->action), "prepared relocation did not start");
+    auto paused = f.event<glm::ContextProgress>();
+    f.idle();
+    require(paused.paused && paused.paused->has_snapshot() &&
+                f.session.checkpoint_metadata(*paused.paused->snapshot_handle()).placement.value ==
+                    0,
+            "prepared relocation lost its target after victim retirement");
+    require(f.session.revoke_snapshot(*paused.paused), "relocated snapshot did not retire");
+    paused.paused.reset();
+    f.idle();
+    fillers.clear();
+    require(!f.session.physical_usage().state_objects &&
+                !f.session.physical_usage().history_objects,
+            "relocation preflight retained source or destination state");
+}
+
 void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     for (unsigned frontier : {3U, 4U, 63U, 64U, 65U}) {
         Fixture f(definition);
@@ -332,7 +896,8 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(progress.capture_ready && !progress.pending,
                 "input checkpoint boundary not honored");
         f.idle();
-        require(f.session.start_capture(sequence), "capture did not start");
+        require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
+                "capture did not start");
         const auto captured = f.event<glm::ContextProgress>();
         require(captured.published && !captured.captured_checkpoints.empty(),
                 "capture did not publish");
@@ -341,8 +906,20 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(f.session.abort(sequence).status == rt::ConsumeStatus::Consumed,
                 "captured writer release failed");
         f.idle();
+        const auto quotes = f.session.recovery_points();
+        require(!quotes.empty() && quotes.front().description->identity->rebuild(2).tokens == 2,
+                "native recovery quote lost the captured target");
+        const auto repeated = f.session.recovery_points();
+        require(repeated.size() == quotes.size() &&
+                    repeated.front().handle == quotes.front().handle &&
+                    repeated.front().description->identity == quotes.front().description->identity,
+                "simultaneous recovery views duplicated immutable identity metadata");
         for (auto checkpoint : captured.captured_checkpoints)
-            require(f.session.release_checkpoint(checkpoint), "captured source release failed");
+            require(f.session.release_checkpoint(checkpoint), "quote retained a State/KV lease");
+        require(quotes.front().description->identity->rebuild(0).tokens == 4 &&
+                    quotes.front().description->identity->prefix_of(
+                        *quotes.front().description->identity),
+                "retired checkpoint invalidated its decision identity");
         const auto usage = f.session.physical_usage();
         require(!usage.state_objects && !usage.history_objects,
                 "capture retained its source or writer");
@@ -359,7 +936,7 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     std::array<rt::RoundBudget, 2> budgets;
     for (auto& v : budgets) v.generated_tokens_remaining = 4;
     require(f.session.start_decode(members, budgets).has_value(), "decode start failed");
-    require(f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
+    require(glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
             "physical owner order not planned");
     auto result = f.event<glm::PendingBatch>();
     require(result.tokens()[0] == s1.value % 2 && result.tokens()[1] == s0.value % 2,
@@ -375,6 +952,79 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
                 std::all_of(usage.kv_page_groups.begin(), usage.kv_page_groups.end(),
                             [](auto n) { return n == 0; }),
             "discard leaked context objects");
+}
+
+void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(4);
+    const auto first   = f.bind(request, 0, 1);
+    const glm::ExecutionUnit unit{first, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&unit, 1})), "retry input reservation");
+    require(f.session.prepare_capture(first)->reserved, "retry initial capture reservation");
+    f.session.skip_capture(first);
+    require(f.session.start_prefill(first).has_value(), "retry prefill start");
+    auto result = f.event<glm::PrefillProgress>();
+    require(result.complete && result.pending && !result.capture_ready,
+            "skipped capture changed the normal prefill boundary");
+    f.commit(std::move(*result.pending));
+    require(f.session.retry_capture(first), "completed prefill lost its retryable input frontier");
+    require(f.session.prepare_capture(first)->reserved,
+            "late capture could not reserve without a compute permit");
+    auto frame = f.executor.try_reserve(rt::FrameKind::Context);
+    require(frame.has_value() && f.session.start_capture(first) == rt::ContextStart::Deferred,
+            "temporarily busy context frame discarded an input capture");
+    frame.reset();
+    require(f.session.start_capture(first) == rt::ContextStart::Started,
+            "deferred capture did not start");
+    auto captured = f.event<glm::ContextProgress>();
+    f.idle();
+    require(captured.published && captured.captured_checkpoints.size() == 1,
+            "retried input capture did not publish");
+    const auto old = captured.captured_checkpoints.front();
+    require(f.session.abort(first).status == rt::ConsumeStatus::Consumed, "retried writer release");
+    f.idle();
+
+    const auto second = f.bind(request, 0, 1);
+    const glm::ExecutionUnit next{second, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&next, 1})), "shared capture compute reservation");
+    const auto before = f.session.physical_usage();
+    const auto alias  = f.session.share_capture(second, old);
+    require(alias.size() == 1 && alias.front() != old,
+            "same-position input did not share the complete snapshot");
+    const auto after = f.session.physical_usage();
+    require(before.state_objects == after.state_objects &&
+                before.kv_page_groups == after.kv_page_groups,
+            "sharing an input snapshot allocated another State or KV history");
+    f.commit(f.prefill(second));
+    require(f.session.abort(second).status == rt::ConsumeStatus::Consumed, "shared writer release");
+    f.idle();
+    const auto third = f.bind(f.request(8), 0, 1);
+    const glm::ExecutionUnit growing{third, glm::ExecutionUnitKind::Prefill, 8};
+    require(bool(f.session.reserve_units({&growing, 1})), "replacement compute reservation");
+    std::vector<ctx::RecordLease> fillers;
+    for (;;) {
+        auto held = f.directory->records().reserve(
+            ctx::RecordDemand{ctx::state_record_layout(1), ctx::ContextMemory::Device, 1});
+        if (!held || !held->ready()) break;
+        for (const auto& part : f.layout.context.state.layouts[1].parts)
+            fillers.push_back(held->materialize(part.rank));
+    }
+    const auto replacement = f.session.prepare_capture(third, {&old, 1});
+    require(replacement && !replacement->reserved && f.session.valid_checkpoint(old) &&
+                f.session.valid_checkpoint(alias.front()),
+            "failed whole-placement preparation deleted a still-shared input checkpoint");
+    fillers.clear();
+    require(f.session.prepare_capture(third)->reserved,
+            "capture did not recover when capacity returned");
+    require(f.session.abort(third).status == rt::ConsumeStatus::Consumed,
+            "replacement writer release");
+    f.idle();
+    require(f.session.release_checkpoint(old) && f.session.valid_checkpoint(alias.front()),
+            "retiring a prior role invalidated its shared snapshot");
+    require(f.session.release_checkpoint(alias.front()), "shared capture release");
+    require(!f.session.physical_usage().state_objects &&
+                !f.session.physical_usage().history_objects,
+            "shared capture leaked its complete snapshot");
 }
 
 void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -393,9 +1043,9 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         budgets[1].generated_tokens_remaining = 1;
         f.executor.accept                     = {accepted, 0};
         require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
-        const auto& work = std::get<glm::MtpWork>(f.executor.last.operation);
+        const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
-                    f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
+                    glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
                 "mixed MTP rows lost extents or ownership");
         require(work.rows[0].mtp_frontier == 62 && work.rows[1].mtp_frontier == 3,
                 "MTP canonical frontier is not Main minus one");
@@ -429,14 +1079,446 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
                 "MTP provisional suffix leaked");
     }
 }
+
+// Real EngineCore + real Session/Directory, with deterministic executor completions.
+// The four-page catalog fits either full request but not both requests' next growth.
+// No model arithmetic or GPU is involved in this scheduling/lifecycle check.
+void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, bool inject_failure,
+                     bool stop_during_replay = false) {
+    Fixture f(definition, true);
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{f.frontend, &f.executor, &f.session};
+
+    EngineOptions options;
+    options.max_context           = 256;
+    options.max_concurrency       = 3;
+    options.context_cache.enabled = false;
+    f.executor.unit_time_ns       = 500'000'000;
+    f.executor.defer_binding      = 3;
+    f.executor.hold_poll          = true;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    using Submission = decltype(engine)::Submission;
+    std::array<Submission, 3> submitted;
+    std::array<GenerationResult, 3> results;
+    std::array<std::exception_ptr, 3> errors;
+    std::array<std::vector<GenerationSchedulingObservation>, 3> observations;
+    for (unsigned row = 0; row < submitted.size(); ++row) {
+        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, row), true);
+        const auto summary = prompt.summary();
+        rt::ResolvedRequestOptions request;
+        request.execution.requested_output_tokens = 120;
+        request.execution.allow_prefix_reuse      = false;
+        request.output.raw                        = true;
+        request.stop.include_model_defaults       = false;
+        GenerationObservationOptions observe;
+        observe.scheduling = [&, row](const auto& event) { observations[row].push_back(event); };
+        submitted[row]     = engine.submit(std::move(prompt), summary, 0, request,
+                                           OutputConsumerMode::Aggregate, observe);
+    }
+    std::atomic<bool> replay_blocked{false};
+    if (stop_during_replay)
+        f.executor.replay_submitted = [&] {
+            f.executor.hold_poll = true;
+            replay_blocked       = true;
+        };
+    if (inject_failure) f.executor.fail_poll = true;
+    f.executor.hold_poll = false;
+    const auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::array<std::jthread, 3> consumers;
+    for (unsigned row = 0; row < submitted.size(); ++row)
+        consumers[row] = std::jthread([&, row] {
+            try {
+                results[row] = submitted[row].wait(
+                    nullptr,
+                    CancellationView([&] { return std::chrono::steady_clock::now() >= deadline; }));
+            } catch (...) { errors[row] = std::current_exception(); }
+        });
+    if (stop_during_replay) {
+        while (!replay_blocked && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        engine.request_stop();
+    }
+    for (auto& consumer : consumers) consumer.join();
+    if (stop_during_replay) require(replay_blocked, "stop fixture did not enter replay");
+    if (inject_failure || stop_during_replay) {
+        for (auto error : errors) {
+            require(bool(error), "worker failure did not terminate every request");
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& cause) {
+                require(std::string(cause.what()) == (stop_during_replay
+                                                          ? "inference engine is shutting down"
+                                                          : "injected executor polling failure"),
+                        "failure cleanup replaced the first cause");
+            }
+        }
+        require(!engine.is_available(), "failed Engine remained available");
+        auto prompt        = f.frontend.prepare_tokens({0}, true);
+        const auto summary = prompt.summary();
+        bool unavailable   = false;
+        try {
+            (void)engine.submit(std::move(prompt), summary, 0, {}, OutputConsumerMode::Aggregate,
+                                {});
+        } catch (const RequestError& error) {
+            unavailable = error.kind() == RequestErrorKind::Unavailable;
+        }
+        require(unavailable, "failed worker accepted a subsequent request");
+    } else {
+        for (auto error : errors)
+            if (error) std::rethrow_exception(error);
+        for (unsigned row = 0; row < submitted.size(); ++row) {
+            require(results[row].finish_reason == FinishReason::OutputLimit &&
+                        results[row].generated_token_ids.size() == 120,
+                    "pressure request did not finish within its original budget");
+            unsigned recoveries    = 0;
+            std::uint64_t frontier = 0;
+            for (const auto& event : observations[row]) {
+                if (event.transition != GenerationSchedulingTransition::RecoveryComplete) continue;
+                require(event.request_prefill_tokens + event.request_decode_tokens > frontier,
+                        "recovery repeated an old frontier without new progress");
+                frontier = event.request_prefill_tokens + event.request_decode_tokens;
+                ++recoveries;
+            }
+            require(recoveries >= 2, "old resident or paused request monopolized service");
+        }
+        require(engine.is_available(), "ordinary Context pressure failed the Engine");
+        require(engine.snapshot().runtime.direct_restores != 0,
+                "pressure fixture did not restore a request paused before its first chunk");
+        bool direct_prefill = false;
+        for (const auto& row : observations)
+            for (const auto& event : row)
+                if (event.transition == GenerationSchedulingTransition::Restored &&
+                    event.route == GenerationRecoveryRoute::Direct) {
+                    require(event.phase == RequestPhase::Prefill &&
+                                event.request_prefill_tokens == 0,
+                            "zero-frontier restoration did not resume prefill");
+                    direct_prefill = true;
+                }
+        require(direct_prefill, "direct restoration did not publish its actual phase");
+    }
+    const auto snapshot = engine.snapshot().runtime;
+    require(!snapshot.running_requests && !snapshot.waiting_requests && !snapshot.paused_requests &&
+                !snapshot.state_objects && !snapshot.history_objects,
+            "Engine pressure/failure cleanup retained requests or Context objects");
+}
+
+void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition, true);
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{f.frontend, &f.executor, &f.session};
+
+    EngineOptions options;
+    options.max_context           = 256;
+    options.max_concurrency       = 3;
+    options.context_cache.enabled = false;
+    f.executor.hold_poll          = true;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, 0), true);
+    const auto summary = prompt.summary();
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 100;
+    request.output.raw                        = true;
+    auto submission =
+        engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate, {});
+    // Published residency/execution proves the worker, rather than just the pending queue,
+    // must settle this request when stopping. The executor is deliberately not making progress.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (engine.snapshot().in_flight.empty() &&
+           !engine.snapshot().runtime.materializing_requests &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(engine.snapshot().runtime.materializing_requests != 0 ||
+                !engine.snapshot().in_flight.empty(),
+            "stop fixture never submitted work");
+    engine.request_stop();
+    engine.request_stop();
+    require(!engine.is_available(), "stop did not immediately close admission");
+    bool stopped = false;
+    try {
+        (void)submission.wait(nullptr, {});
+    } catch (const RequestError& error) { stopped = error.kind() == RequestErrorKind::Unavailable; }
+    require(stopped, "stop did not release a waiting generation consumer");
+    const auto snapshot = engine.snapshot();
+    require(snapshot.status == EngineStatus::Stopping && !snapshot.runtime.running_requests &&
+                !snapshot.runtime.waiting_requests && !snapshot.runtime.state_objects &&
+                !snapshot.runtime.history_objects && !f.executor.has_pending_work(),
+            "stop retained pending work or Context ownership");
+}
+
+// A Native retirement dependency ends between Engine calls. The retained identity is
+// observable evidence that the request still owns the same decision across that yield.
+class DeferredExecutionSession : public glm::Session {
+public:
+    using glm::Session::Session;
+    std::atomic<bool> arm{false}, survived{false};
+    enum class Stage { Idle, Need, Deferred, Finished } stage = Stage::Idle;
+    mutable std::weak_ptr<const rt::RecoveryIdentity> observed;
+    mutable bool captured = false;
+
+    glm::ResourceReservation reserve_units(std::span<const glm::ExecutionUnit> units) {
+        if (arm && stage == Stage::Idle) {
+            stage = Stage::Need;
+            return {.assessment = {.status = ctx::ContextAvailability::NeedsMaintenance}};
+        }
+        return glm::Session::reserve_units(units);
+    }
+
+    glm::ContextAssessment assess(const glm::ContextDemand& demand,
+                                  const glm::ContextReleaseSet& released = {}) const {
+        if (stage == Stage::Need)
+            return {.demand = demand, .status = ctx::ContextAvailability::NeedsMaintenance};
+        return glm::Session::assess(demand, released);
+    }
+
+    std::vector<RecoveryPoint>
+    recovery_points(const glm::ContextReleaseSet& removed           = {},
+                    std::span<const glm::CheckpointHandle> selected = {}) const {
+        auto points = glm::Session::recovery_points(removed, selected);
+        if (stage == Stage::Need && !captured && selected.empty() && !points.empty()) {
+            observed = points.front().description->identity;
+            captured = true;
+        }
+        return points;
+    }
+
+    rt::ContextStart start_maintenance(const glm::ContextAssessment& assessment) {
+        if (stage == Stage::Need) {
+            stage = Stage::Deferred;
+            return rt::ContextStart::Deferred;
+        }
+        return glm::Session::start_maintenance(assessment);
+    }
+
+    bool has_context_operation() const {
+        return stage == Stage::Deferred || glm::Session::has_context_operation();
+    }
+
+    std::optional<glm::SessionEvent> poll() {
+        if (stage == Stage::Deferred) {
+            survived = captured && !observed.expired();
+            stage    = Stage::Finished;
+        }
+        return glm::Session::poll();
+    }
+};
+
+struct DeferredExecutionRuntime : glm::RuntimeTypes {
+    using Session = DeferredExecutionSession;
+};
+
+void execution_decision_survives_deferral(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout   = plan(*definition);
+    auto frontend = make_frontend();
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    DeferredExecutionSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = DeferredExecutionRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        DeferredExecutionSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context           = 256;
+    options.max_concurrency       = 3;
+    options.context_cache.enabled = true;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.allow_prefix_reuse      = true;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    const auto submit                         = [&](TokenId token) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(4, token), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                     {});
+    };
+    require(submit(0).wait(nullptr, {}).finish_reason == FinishReason::OutputLimit,
+            "decision deferral seed did not finish");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    session.arm = true;
+    require(submit(1).wait(nullptr, {}).finish_reason == FinishReason::OutputLimit &&
+                session.survived,
+            "Engine dropped the executing request's decision at an asynchronous dependency");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(session.observed.expired(), "granted execution retained a completed decision");
+}
+
+// Hold one capture's external retirement dependency while independent requests may run.
+class WaitingCaptureSession : public glm::Session {
+public:
+    using glm::Session::Session;
+    std::atomic<bool> waiting{true};
+    std::atomic<bool> observed{false};
+    std::optional<glm::SequenceHandle> blocked;
+
+    std::optional<glm::CapturePreparation>
+    prepare_capture(glm::SequenceHandle sequence,
+                    std::span<const glm::CheckpointHandle> victims = {},
+                    runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic) {
+        if (!blocked) blocked = sequence;
+        if (sequence == blocked && waiting) {
+            observed = true;
+            return glm::CapturePreparation{
+                .frontier = 64, .assessment = {.status = ctx::ContextAvailability::Waiting}};
+        }
+        return glm::Session::prepare_capture(sequence, victims, storage);
+    }
+};
+
+struct WaitingCaptureRuntime : glm::RuntimeTypes {
+    using Session = WaitingCaptureSession;
+};
+
+void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout   = plan(*definition);
+    auto frontend = make_frontend();
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    WaitingCaptureSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = WaitingCaptureRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        WaitingCaptureSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context     = 256;
+    options.max_concurrency = 3;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    auto submit                               = [&](TokenId token) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(64, token), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                           {});
+    };
+    auto first          = submit(0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!session.observed && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(session.observed, "first prefill did not wait for capture capacity");
+    const auto second = submit(1).wait(
+        nullptr, CancellationView([&] { return std::chrono::steady_clock::now() >= deadline; }));
+    session.waiting = false;
+    require(second.finish_reason == FinishReason::OutputLimit,
+            "waiting capture blocked an independently runnable prefill");
+    require(first.wait(nullptr, {}).finish_reason == FinishReason::OutputLimit,
+            "prefill did not resume after capture capacity retired");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(!engine.snapshot().runtime.running_requests && !executor.has_pending_work(),
+            "prefill fallback retained a request or execution");
+}
+
+void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{f.frontend, &f.executor, &f.session};
+
+    EngineOptions options;
+    options.max_context              = 256;
+    options.max_concurrency          = 3;
+    options.context_cache.enabled    = true;
+    f.executor.hold_prefill_frontier = 128;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    auto submit                               = [&](unsigned length) {
+        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(length, 0), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                           {});
+    };
+    const auto warmup = submit(64).wait(nullptr, {});
+    require(warmup.finish_reason == FinishReason::OutputLimit &&
+                warmup.stats.timings.first_token_seconds.has_value(),
+            "prefix statistics warmup did not produce a token");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    auto pending        = submit(224);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!f.executor.hold_poll && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(f.executor.hold_poll, "cancellation fixture did not reach partial prefill");
+    unsigned checks      = 0;
+    const auto cancelled = pending.wait(nullptr, CancellationView([&] {
+                                            // The first check publishes cancellation; the next
+                                            // allows its device reader to retire.
+                                            if (++checks == 2) f.executor.hold_poll = false;
+                                            return true;
+                                        }));
+    require(cancelled.finish_reason == FinishReason::Cancelled &&
+                cancelled.generated_token_ids.empty() &&
+                !cancelled.stats.timings.first_token_seconds &&
+                !cancelled.stats.first_output_timing,
+            "cancelled prefill fabricated output or its timing");
+    require(cancelled.stats.reused_prompt_tokens == 64 &&
+                cancelled.stats.prefix_reuse_path == PrefixReusePath::Checkpoint &&
+                cancelled.stats.computed_prefill_tokens > 0 &&
+                cancelled.stats.computed_prefill_tokens < 224 - 64,
+            "cancelled prefill lost its admitted prefix or completed work");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(!engine.snapshot().runtime.running_requests && !f.executor.has_pending_work(),
+            "cancelled prefill retained execution resources");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
+        batch_geometry();
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
+        identity_budget_replacement(glm::read_definition(reader, {}));
+        identity_budget_retirement(glm::read_definition(reader, {}));
+        recovery_quotes_match_tail_copies(glm::read_definition(reader, {}));
+        recovery_quotes_match_tail_copies(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp}));
+        pause_quotes_match_shared_draft(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::DFlash2}));
+        execution_decision_survives_deferral(glm::read_definition(reader, {}));
+        relocation_preflight_includes_destination_victims(glm::read_definition(reader, {}));
         transactions(glm::read_definition(reader, {}));
+        capture_replacement_and_retry(glm::read_definition(reader, {}));
+        fragmented_capture(glm::read_definition(reader, {}));
+        engine_pressure(glm::read_definition(reader, {}), false);
+        engine_pressure(glm::read_definition(reader, {}), true);
+        engine_stop(glm::read_definition(reader, {}));
+        independent_prefill(glm::read_definition(reader, {}));
+        cancelled_prefix_statistics(glm::read_definition(reader, {}));
+        engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+        expanded_membership(mtp);
         mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";
     } catch (const std::exception& e) {

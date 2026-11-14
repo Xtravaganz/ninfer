@@ -1,3 +1,4 @@
+#include "models/common/qwen/recovery_value.h"
 #include "models/qwen4_exp/session/internal.h"
 #include "models/common/context/work.h"
 
@@ -5,7 +6,11 @@
 
 namespace ninfer::models::qwen4_exp {
 
-std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
+
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -23,7 +28,11 @@ bool Session::release_checkpoint(CheckpointHandle h) noexcept {
 CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
     const auto& p = *impl_;
     const auto& c = p.checkpoints.at(h);
-    return {c.frontier(), c.role, p.checkpoints[h.index].pins != 0, c.origin};
+    return {.frontier = c.frontier(),
+            .role     = c.role,
+            .leased   = p.checkpoints[h.index].pins != 0,
+            .origin   = c.origin,
+            .evidence = c.evidence};
 }
 
 PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
@@ -46,6 +55,13 @@ std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle h, const Re
     return checkpoint_matches(h, base) && impl_->checkpoints.at(h).frontier() <= target
                ? impl_->checkpoints.at(h).frontier()
                : 0;
+}
+
+std::vector<PlacementDescriptor> Session::placement_descriptions() const {
+    PlacementDescriptor placement;
+    for (const auto& rank : impl_->plan.context.ranks)
+        placement.attention_ranks.push_back(rank.rank);
+    return {std::move(placement)};
 }
 
 std::span<const runtime::PlacementId> Session::placements(const RequestBasePlan&) const {
@@ -100,30 +116,16 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.reused_tokens = h ? p.checkpoints.at(*h).frontier() : 0;
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
-    out.remaining_work = runtime::make_prefill_work(out.reused_tokens, end - out.reused_tokens, 0,
-                                                    0, p.shape.prefill_chunk);
-    for (const auto& item : base.plan_->prompt.vision_items)
-        if (item.token_spans.back().begin + item.token_spans.back().count > out.reused_tokens &&
-            item.token_spans.front().begin < end) {
-            ++out.remaining_work.vision_items;
-            out.remaining_work.vision_patches += item.patch_count;
-        }
-    if (const auto& vision = base.plan_->vision) {
-        out.remaining_work.chunks = 0;
-        const vision::Window available;
-        for (auto cursor = out.reused_tokens; cursor < end;) {
-            cursor = available.limit({}, vision->units, cursor,
-                                     std::min(end, cursor + p.shape.prefill_chunk),
-                                     p.plan.vision_max_features);
-            ++out.remaining_work.chunks;
-        }
-    }
+    out.remaining_work =
+        qwen::recovery_work(base.plan_->prompt.vision_items, out.reused_tokens, end,
+                            p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c      = p.checkpoints.at(*h);
         const auto image   = c.snapshot.continuation().image;
         const auto& states = p.directory.states();
-        out.consume_source = consume && p.checkpoints[h->index].pins == 0 &&
-                             states.checkpoint_references(image) == 1 && !states.source_pins(image);
+        const bool own     = resume && resume->snapshot_handle() == h;
+        out.consume_source = (consume || own) && p.checkpoints[h->index].pins == 0 &&
+                             states.can_recover_exclusively(image);
         out.transfers = c.snapshot.restore_requirements(p.directory);
         out.local_device =
             states.device_resident(image) &&
@@ -136,7 +138,19 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
             p.checkpoints.at(point).frontier() <= out.reused_tokens)
             out.private_points.push_back(point);
     for (const auto point : retired)
-        if ((!h || point != *h) && valid_checkpoint(point)) out.retired_points.push_back(point);
+        if ((!h || point != *h) && valid_checkpoint(point) &&
+            std::find(out.retired_points.begin(), out.retired_points.end(), point) ==
+                out.retired_points.end())
+            out.retired_points.push_back(point);
+    if (h) {
+        const auto& snapshot = p.checkpoints.at(*h).snapshot;
+        std::vector<const detail::Snapshot*> retired_snapshots;
+        for (auto point : out.retired_points)
+            retired_snapshots.push_back(&p.checkpoints.at(point).snapshot);
+        if (out.consume_source) retired_snapshots.push_back(&snapshot);
+        auto copies = snapshot.replay_requirements(p.directory, retired_snapshots);
+        out.transfers.insert(out.transfers.end(), copies.begin(), copies.end());
+    }
     return out;
 }
 
@@ -165,7 +179,7 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
     const bool resident    = checkpoint && states.device_resident(image);
     const bool consume     = checkpoint && (own || candidate.consume_source) &&
                          checkpoints[source->index].pins == 0 &&
-                         states.checkpoint_references(image) == 1 && !states.source_pins(image);
+                         states.can_recover_exclusively(image);
     const bool split = checkpoint && !consume && resident && states.host_resident(image) &&
                        !states.source_pins(image);
     const auto target = resume ? resume->frontier() : frontier;
@@ -357,6 +371,16 @@ ContextProgress detail::SessionImpl::complete_context() {
         if (auto* tx = std::get_if<detail::BindOperation>(&operation.action)) {
             if (!tx->binding) throw std::logic_error("binding operation has no prepared sequence");
             auto& s = *tx->binding;
+            if (tx->resume) {
+                result.recovery = {
+                    .route = s.phase == detail::Phase::Replay ? GenerationRecoveryRoute::Replay
+                             : tx->source                     ? GenerationRecoveryRoute::Snapshot
+                                                              : GenerationRecoveryRoute::Direct,
+                    .begin_frontier  = tx->frontier,
+                    .frontier        = tx->frontier,
+                    .target_frontier = tx->target,
+                };
+            }
             for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
                 s.histories[pool] = migration.binding(pool)->commit();
             using StateAction = detail::StateBindingAction;
@@ -401,17 +425,18 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.operations.partial_tail_cow_pages = tail_copies;
             result.sequence                          = p.handle(s);
             result.residency                         = p.member(s).residency;
-            result.replaying                         = s.phase == detail::Phase::Replay;
             result.private_points                    = std::move(tx->carried);
             result.retired_checkpoints               = std::move(tx->retired);
             p.sequences[tx->lane]                    = std::move(tx->binding);
+            p.resident_sequences.emplace(s.id, &s);
             tx->clones.clear();
         } else if (auto* tx = std::get_if<detail::CaptureOperation>(&operation.action)) {
             auto& s = *p.sequences[tx->lane];
             result.captured_checkpoints.reserve(tx->reservation->records.size());
             for (const auto& [record, role] : tx->reservation->records) {
                 p.checkpoints.publish(record,
-                                      {*tx->snapshot, role, s.captures[s.next_capture].origin});
+                                      {*tx->snapshot, role, s.captures[s.next_capture].origin,
+                                       s.captures[s.next_capture].evidence});
                 result.captured_checkpoints.push_back(record);
             }
             const auto writer    = context::adopt_capture_writer(states, s.continuation.image,
@@ -453,6 +478,7 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
 
     std::vector<Need> needed;
     ContextDemand demand;
+    const auto mark = p.next_membership_mark();
     for (const auto& unit : units) {
         auto& sequence = p.sequence(unit.sequence);
         if ((unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) &&
@@ -460,9 +486,9 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
                 sequence.continuation.metadata.main_frontier &&
             sequence.continuation.metadata.main_frontier < sequence.request->summary.prompt_tokens)
             return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
-        if (std::any_of(needed.begin(), needed.end(),
-                        [&](const auto& n) { return n.sequence == &sequence; }))
+        if (sequence.membership_mark == mark)
             throw std::logic_error("execution reservation repeats a sequence");
+        sequence.membership_mark = mark;
         Need need{&sequence,
                   std::max(sequence.recovery_peak, p.unit_end(sequence, unit.kind, unit.tokens))};
         if (need.end > p.shape.max_context) throw std::out_of_range("execution exceeds context");

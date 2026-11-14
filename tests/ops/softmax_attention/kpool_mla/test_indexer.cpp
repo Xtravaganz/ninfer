@@ -74,17 +74,29 @@ int run(int T, int B, int E, int kind = -1, bool fp8 = false, bool fp8_index = f
     return verify(f, kind >= 0);
 }
 
-int graph(bool fp8_index = false, int T = 129, int B = 3) {
+int graph(bool fp8_index = false, int T = 129, int B = 3, int maximum = 262148) {
     auto& d = cuda_environment().context;
     kp::IndexerFixture f(
-        d.execution_view(), T, B, 262148, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
+        d.execution_view(), T, B, maximum, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
         fp8_index ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
+    const auto bounds = maximum == 8192 ? std::vector<int>{2051, 8192, 0, 4096}
+                                        : std::vector<int>{2051, 262148, 131108, 0, 8192};
+    // Capacity is for a fixed Host envelope; different envelopes may choose
+    // different windows. Reserve the union before capturing any child graph.
+    for (int bound : bounds)
+        f.workspace_bytes =
+            std::max(f.workspace_bytes, ops::kpool_indexer_workspace_capacity_bytes(
+                                            {32, 128}, f.cache.format, {unsigned(bound)}, B, 1, T,
+                                            d.execution_view().multiprocessor_count()));
+    f.scratch = DeviceBuffer(d.execution_view().device(), f.workspace_bytes + 512);
+    f.scratch.fill(0xa5);
+    f.workspace = std::make_unique<MemoryArena>(f.scratch.span().subspan(256, f.workspace_bytes));
     DecodeGraphDefinition outer;
     DecodeGraphExecutable graph;
     DecodeGraphChild child;
     std::optional<ops::KpoolGraphProfile> installed;
     int failures = 0;
-    for (int bound : {2051, 262148, 131108, 0, 8192}) {
+    for (int bound : bounds) {
         f.envelope.max_visible_tokens = bound;
         for (int b = 0; b < f.B; ++b) {
             f.valid.at(b)     = bound ? (b == 2 ? 0 : f.T) : 0;
@@ -109,7 +121,7 @@ int graph(bool fp8_index = false, int T = 129, int B = 3) {
         }
         // Relocate page mappings and turn another row into all-select after capture.
         for (int p = 0; p + 1 < f.P; p += 2) std::swap(f.tables.at(p, 0), f.tables.at(p + 1, 0));
-        if (bound > 2051) {
+        if (bound > 2051 && f.B > 1) {
             f.selectors.at(1) = -1;
             for (int t = 0; t < f.T; ++t) f.positions.at(t, 1) = t;
         }
@@ -169,6 +181,55 @@ int mixed_history() {
     return verify(f);
 }
 
+int token_sweep(bool fp8) {
+    auto& d = cuda_environment().context;
+    kp::IndexerFixture f(
+        d.execution_view(), 17, 3, 8192, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
+        fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
+    int failures = 0;
+    for (int tokens : {1, 3, 2, 17, 8}) {
+        f.reset_tokens(tokens, true, d.execution_view());
+        f.launch(d.execution_view());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
+int request_groups(bool fp8) {
+    auto& d = cuda_environment().context;
+    kp::IndexerCase shape;
+    constexpr int batch = 129, tokens = 2;
+    shape.ends.resize(batch, 2052);
+    shape.valid.resize(batch, tokens);
+    shape.envelope = 2052;
+    for (int b = 0; b < batch; ++b) {
+        if (b >= 64 && b < 128)
+            shape.valid[b] = 0;
+        else if (b % 3 == 0)
+            shape.ends[b] = 2051;
+        else if (b % 3 == 1)
+            shape.valid[b] = 1;
+    }
+    kp::IndexerFixture f(d.execution_view(), tokens, batch, shape.envelope, 1, false,
+                         ops::KpoolMlaStorage::BFloat16, shape, true,
+                         fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                             : KvCacheVectorFormat::BFloat16);
+    for (int b = 0; b < batch; ++b) {
+        if (shape.ends[b] <= 2051 || !shape.valid[b]) {
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < tokens; ++t)
+                for (int h = 0; h < 32; ++h)
+                    for (int k = 0; k < 128; ++k) f.query.at(k, h, t, b) = 0x7fc0;
+        }
+    }
+    f.upload_metadata();
+    f.query.upload();
+    f.launch(d.execution_view());
+    d.synchronize();
+    return verify(f);
+}
+
 int workspace_interval(bool fp8 = false) {
     auto& d = cuda_environment().context;
     const auto format =
@@ -180,7 +241,7 @@ int workspace_interval(bool fp8 = false) {
         return ops::kpool_indexer_workspace_capacity_bytes(
             {32, 128}, format, {E}, B, lo, hi, d.execution_view().multiprocessor_count());
     };
-    for (int B : {1, 2, 3, 5, 8})
+    for (int B : {1, 2, 3, 5, 8, 9, 17, 33})
         for (unsigned E : {8192u, 65536u, 131072u, 262144u, 1048576u})
             for (auto [lo, hi] : {std::pair{1, 257}, {127, 513}}) {
                 std::size_t peak = 0;
@@ -247,6 +308,16 @@ int main(int argc, char** argv) {
         suite.add("kpool_indexer/" + std::to_string(T) + "x" + std::to_string(B) + "/" +
                       std::to_string(E),
                   [=] { return run(T, B, E); }, {{"format", "bf16"}, {"execution", "eager"}});
+    for (const bool fp8 : {false, true}) {
+        const std::string prefix = fp8 ? "kpool_indexer/fp8/" : "kpool_indexer/";
+        const std::string format = fp8 ? "fp8" : "bf16";
+        suite.add(prefix + "batch9", [=] { return run(4, 9, 8192, -1, false, fp8); },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
+        suite.add(prefix + "request_groups", [=] { return request_groups(fp8); },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
+        suite.add(prefix + "graph_batch17", [=] { return graph(fp8, 3, 17, 8192); },
+                  {{"format", format}, {"execution", "graph"}, {"suite", "concurrency"}});
+    }
     for (int kind : {0, 1, 2})
         suite.add("kpool_indexer/exact/" + std::to_string(kind),
                   [=] { return run(1, 1, 131076, kind); },
@@ -255,20 +326,25 @@ int main(int argc, char** argv) {
               {{"format", "bf16"}, {"execution", "eager"}});
     suite.add("kpool_indexer/graph", [] { return graph(); },
               {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("kpool_indexer/graph_single", [] { return graph(false, 129, 1); });
     suite.add("kpool_indexer/graph_growth", [] { return graph_growth(false); },
               {{"format", "bf16"}, {"execution", "graph"}});
     suite.add("kpool_indexer/workspace_interval", [] { return workspace_interval(); });
     suite.add("kpool_indexer/admission", admission);
+    suite.add("kpool_indexer/token_sweep", [] { return token_sweep(false); });
+    suite.add("kpool_indexer/exact_wide", [] { return run(8, 2, 131076, 0); });
     for (auto [T, B, E] :
-         {std::tuple{1, 1, 2051}, {1, 1, 2052},    {1, 1, 8192},    {2, 1, 16388},
-          {3, 1, 32768},          {4, 1, 32768},   {5, 1, 32768},   {8, 1, 65536},
-          {15, 1, 262144},        {16, 1, 262144}, {17, 1, 262144}, {31, 1, 131072},
-          {32, 1, 131072},        {33, 1, 131072}, {17, 3, 131108}, {1, 1, 1048576},
-          {16, 1, 1048576},       {127, 1, 65536}, {128, 1, 65536}, {129, 1, 65536},
-          {255, 1, 65536},        {256, 1, 65536}, {257, 1, 65536}, {65, 4, 262144},
-          {129, 8, 131108},       {7, 8, 262144},  {8, 8, 262144},  {9, 8, 262144},
-          {16, 8, 262144},        {17, 8, 65536},  {16, 5, 131072}, {128, 2, 262144},
-          {31, 4, 262144},        {32, 4, 262144}, {33, 4, 262144}, {17, 2, 0}})
+         {std::tuple{1, 1, 2051}, {1, 1, 2052},     {1, 1, 8192},      {2, 1, 16388},
+          {3, 1, 32768},          {4, 1, 32768},    {5, 1, 32768},     {8, 1, 65536},
+          {15, 1, 262144},        {16, 1, 262144},  {17, 1, 262144},   {31, 1, 131072},
+          {57, 1, 65536},         {60, 1, 65536},   {68, 1, 65536},    {100, 1, 65536},
+          {120, 1, 65536},        {33, 1, 1048576}, {127, 1, 1048576}, {128, 1, 1048576},
+          {32, 1, 131072},        {33, 1, 131072},  {17, 3, 131108},   {1, 1, 1048576},
+          {16, 1, 1048576},       {127, 1, 65536},  {128, 1, 65536},   {129, 1, 65536},
+          {255, 1, 65536},        {256, 1, 65536},  {257, 1, 65536},   {65, 4, 262144},
+          {129, 8, 131108},       {7, 8, 262144},   {8, 8, 262144},    {9, 8, 262144},
+          {16, 8, 262144},        {17, 8, 65536},   {16, 5, 131072},   {128, 2, 262144},
+          {31, 4, 262144},        {32, 4, 262144},  {33, 4, 262144},   {17, 2, 0}})
         suite.add("kpool_indexer/fp8/" + std::to_string(T) + "x" + std::to_string(B) + "/" +
                       std::to_string(E),
                   [=] { return run(T, B, E, -1, false, true); },
@@ -282,9 +358,14 @@ int main(int argc, char** argv) {
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_indexer/fp8/graph_grouping", [] { return graph(true, 16, 8); },
               {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_indexer/fp8/graph_single", [] { return graph(true, 129, 1); });
     suite.add("kpool_indexer/fp8/graph_growth", [] { return graph_growth(true); },
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_indexer/fp8/mixed_history", mixed_history, {{"format", "fp8"}});
+    suite.add("kpool_indexer/fp8/token_sweep", [] { return token_sweep(true); });
+    suite.add("kpool_indexer/fp8/exact_worker_tail",
+              [] { return run(100, 1, 65536, 0, false, true); });
+    suite.add("kpool_indexer/fp8/exact_wide", [] { return run(8, 2, 131076, 0, false, true); });
     suite.add("kpool_indexer/fp8/workspace_interval", [] { return workspace_interval(true); },
               {{"format", "fp8"}});
     return suite.main(argc, argv);

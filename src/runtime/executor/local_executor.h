@@ -15,12 +15,18 @@ public:
     using Protocol = typename Types::ExecutionTypes;
     using Event    = ExecutionEvent<Protocol>;
 
-    LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch)
-        : worker_(std::move(worker)), epoch_(epoch), pool_(worker_->program().capacity()),
-          compute_(pool_.capacity().compute_frames), context_(pool_.capacity().context_frames) {
+    LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch,
+                  std::uint32_t max_decode_rows)
+        : Executor<Protocol>(max_decode_rows), worker_(std::move(worker)), epoch_(epoch),
+          pool_(worker_->program().capacity()), compute_(pool_.capacity().compute_frames),
+          context_(pool_.capacity().context_frames) {
         this->observations_.resize(1);
         this->observations_[0].hardware = worker_->device_name();
         sample_resources(true);
+        const auto& sample = this->observations_[0];
+        this->rank_descriptions_.push_back(
+            {0, 0, worker_->device().index(), sample.hardware,
+             sample.physical_memory && sample.physical_memory->shared_physical_memory});
     }
 
     ~LocalExecutor() override {
@@ -169,7 +175,7 @@ public:
                         value.execution.max_rank_gpu = value.observed.gpu;
                         this->observe_retirement(0, value.observed,
                                                  value.ticket.frame.kind == FrameKind::Compute);
-                        accumulate(this->execution_statistics_, value.execution);
+                        this->observe_execution(value.execution);
                         pool_.retire(value.ticket.frame);
                         flight = {};
                     } else {
@@ -211,6 +217,19 @@ public:
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
 
+    void observe_in_flight(std::vector<ExecutionProgress>& out) const override {
+        for (const auto* flights : {&compute_, &context_})
+            for (const auto& flight : *flights) {
+                if (flight.phase == Phase::Empty) continue;
+                const auto stage = flight.phase == Phase::Decision     ? ExecutionStage::Decision
+                                   : flight.phase == Phase::Result     ? ExecutionStage::ResultReady
+                                   : flight.phase == Phase::Retiring   ? ExecutionStage::Retiring
+                                   : flight.phase == Phase::Discarding ? ExecutionStage::Discarding
+                                                                       : ExecutionStage::Submitted;
+                out.push_back(flight.clock.progress(flight.ticket.id, stage));
+            }
+    }
+
     void measure(MeasurementCommand command) override {
         require_available();
         if (pool_.busy()) throw std::logic_error("measurement boundary requires an idle executor");
@@ -235,8 +254,8 @@ private:
         snapshot.host   = host_;
         if (force || !pool_.in_flight())
             snapshot.physical_memory = sample_physical_memory(worker_->device());
-        snapshot.stamp       = {snapshot.stamp.sequence + 1, now};
-        snapshot.received_ns = now;
+        snapshot.stamp       = {snapshot.stamp.sequence + 1, observation_time_ns()};
+        snapshot.received_ns = snapshot.stamp.sampled_ns;
     }
     enum class Phase : std::uint8_t { Empty, Running, Decision, Result, Retiring, Discarding };
 

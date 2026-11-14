@@ -32,10 +32,19 @@ struct GenerationRates {
 [[nodiscard]] nlohmann::json request_execution_json(const RequestStats&);
 [[nodiscard]] MemoryAllocations sum_allocations(std::span<const RankSnapshot>);
 [[nodiscard]] nlohmann::json resource_json(const RankSnapshot&);
+[[nodiscard]] const char* communication_backend_name(CommunicationBackend);
+[[nodiscard]] nlohmann::json communication_json(const CommunicationWork&);
 [[nodiscard]] const char* context_domain_name(ContextMemoryDomain) noexcept;
 [[nodiscard]] nlohmann::json context_capacity_json(std::span<const ContextPoolCapacity>);
 [[nodiscard]] nlohmann::json context_usage_json(const RuntimeStats&);
 [[nodiscard]] nlohmann::json startup_resources_json(const EngineDescription&, const StartupReport&,
                                                     const EngineSnapshot&);
+// Subtract only cumulative counters. Current gauges, allocation capacities and lifetime peaks
+// retain their original meaning. The two snapshots must belong to one Engine lifetime.
+[[nodiscard]] EngineSnapshot observation_delta(EngineSnapshot current,
+                                               const EngineSnapshot& baseline);
+[[nodiscard]] nlohmann::json observation_json(const EngineSnapshot&, std::uint64_t now_ns);
+[[nodiscard]] std::optional<std::uint64_t> physical_sample_age_ns(const RankSnapshot&,
+                                                                  std::uint64_t now_ns);
 
 } // namespace ninfer::product

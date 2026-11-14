@@ -21,7 +21,6 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
@@ -693,14 +692,13 @@ enum class GenerationSchedulingTransition : std::uint8_t {
     Terminal,
 };
 
-enum class GenerationRecoveryRoute : std::uint8_t { None, Snapshot, Replay };
-
 // Sparse lifecycle observations captured by the Engine worker and delivered by wait() on the
 // consumer thread. Counter deltas between boundaries, less the request's own deltas, measure
 // other requests' completed work during recovery. Decode includes forced control tokens.
 struct GenerationSchedulingObservation {
     GenerationSchedulingTransition transition = GenerationSchedulingTransition::PauseStarted;
     GenerationRecoveryRoute route             = GenerationRecoveryRoute::None;
+    RequestPhase phase                        = RequestPhase::Waiting;
     std::uint64_t engine_request_id           = 0;
     std::uint64_t steady_ns                   = 0;
     std::uint64_t elapsed_ns                  = 0;
@@ -767,7 +765,7 @@ struct RequestStats {
     // Entry B-1 records this request's full step exposure at actual decode batch B.
     // Summing a complete cohort duplicates each such step B times.
     std::vector<ExecutionExposure> decode_by_batch;
-    std::array<DurationCounter, 4> max_rank_gpu{};
+    GpuIntervalCounters max_rank_gpu{};
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
     GenerationAdmissionStats admission;

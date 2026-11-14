@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -29,9 +30,11 @@ class RecoveryEvaluation;
 template <class Handle = CheckpointHandle>
 class RecoveryIndex : public MetadataCapacity {
 public:
+    using Key                  = RecoveryKey;
     static constexpr auto none = std::numeric_limits<std::uint32_t>::max();
 
-    explicit RecoveryIndex(MetadataBudget& budget) : metadata_(budget), scratch_(budget) {}
+    explicit RecoveryIndex(MetadataBudget& budget, MetadataCapacity* auxiliary = nullptr)
+        : metadata_(budget), scratch_(budget), auxiliary_(auxiliary) {}
 
     [[nodiscard]] static std::size_t metadata_bytes(std::size_t capacity) {
         capacity += 255; // Checkpoint descriptors grow by slabs of 256.
@@ -40,7 +43,7 @@ public:
                capacity * sizeof(Depth) + 4 * (capacity + 1) * sizeof(std::uint32_t) +
                capacity * (sizeof(std::uint8_t) + sizeof(std::uint64_t)) +
                (capacity + 1) *
-                   (3 * sizeof(std::uint64_t) + 6 * sizeof(std::uint32_t) + sizeof(LossPath)) +
+                   (4 * sizeof(std::uint64_t) + 6 * sizeof(std::uint32_t) + sizeof(LossPath)) +
                11 * 7;
     }
 
@@ -57,10 +60,12 @@ public:
                               growth(depths_, capacity) +
                               growth(buckets_, hash_capacity(capacity)) +
                               scratch_.growth_bytes(evaluation_bytes(capacity, capacity + 1));
-        return retained + reallocation;
+        return retained + reallocation +
+               (auxiliary_ ? auxiliary_->metadata_requirement(capacity) : 0);
     }
 
     void reserve_metadata(std::size_t capacity) override {
+        if (auxiliary_) auxiliary_->reserve_metadata(capacity);
         if (capacity < slots_.size()) return;
         if (capacity >= none) throw std::length_error("recovery index exceeds uint32");
         metadata_.reserve(slots_, capacity);
@@ -78,6 +83,10 @@ public:
                 if (nodes_[i].first_alias != none) link_bucket(i);
         }
         scratch_.reserve(evaluation_bytes(capacity, capacity + 1));
+    }
+
+    void trim_metadata(std::size_t capacity) noexcept override {
+        if (auxiliary_) auxiliary_->trim_metadata(capacity);
     }
 
     struct Work {
@@ -141,7 +150,8 @@ private:
     };
 
     struct LossPath {
-        std::uint32_t node, worst;
+        std::uint32_t node;
+        std::uint64_t worst;
         bool leaf;
     };
 
@@ -156,7 +166,7 @@ private:
         // starts on an eight-byte boundary, including the byte-per-slot advertised flags.
         const auto aligned = [](std::size_t n) { return (n + 7) / 8 * 8; };
         return aligned(slots) + aligned(slots * sizeof(std::uint64_t)) +
-               3 * aligned(nodes * sizeof(std::uint64_t)) +
+               4 * aligned(nodes * sizeof(std::uint64_t)) +
                6 * aligned(nodes * sizeof(std::uint32_t)) + aligned(nodes * sizeof(LossPath));
     }
 
@@ -292,16 +302,18 @@ private:
         nodes_[index].frontier = frontier;
         nodes_[index].key      = identity;
         add_alias(index, handle);
-        for (auto child = nodes_[parent].first_child; child != none;) {
-            const auto next = nodes_[child].next;
-            if (nodes_[child].frontier > frontier) {
-                const auto other = representative(child);
-                if (key(view, other, frontier) == identity && prefix(view, handle, other)) {
-                    detach(child);
-                    attach(child, index);
+        if (!depths_.empty() && depths_.back().frontier > frontier) {
+            for (auto child = nodes_[parent].first_child; child != none;) {
+                const auto next = nodes_[child].next;
+                if (nodes_[child].frontier > frontier) {
+                    const auto other = representative(child);
+                    if (key(view, other, frontier) == identity && prefix(view, handle, other)) {
+                        detach(child);
+                        attach(child, index);
+                    }
                 }
+                child = next;
             }
-            child = next;
         }
         attach(index, parent);
         link_bucket(index);
@@ -336,6 +348,7 @@ private:
 
     MetadataAccount metadata_;
     mutable MetadataScratch scratch_;
+    MetadataCapacity* auxiliary_     = nullptr;
     const std::uint64_t* revision_   = nullptr;
     std::uint64_t observed_revision_ = 0, epoch_ = 0;
     std::vector<Node> nodes_;
@@ -375,6 +388,7 @@ public:
         node_stamp_     = take.template operator()<std::uint64_t>(nodes);
         memo_stamp_     = take.template operator()<std::uint64_t>(nodes);
         score_stamp_    = take.template operator()<std::uint64_t>(nodes);
+        values_         = take.template operator()<std::uint64_t>(nodes);
         available_      = take.template operator()<std::uint32_t>(nodes);
         nearest_        = take.template operator()<std::uint32_t>(nodes);
         removed_        = take.template operator()<std::uint32_t>(nodes);
@@ -418,6 +432,114 @@ public:
         return x.begin <= y.begin && y.begin < x.end;
     }
 
+    template <class Visit>
+    void visit_prefixes(Handle target, Visit visit) const {
+        check();
+        for (auto node = require_node(target); node; node = index_->nodes_[node].parent)
+            for (auto slot = index_->nodes_[node].first_alias; slot != none;
+                 slot      = index_->slots_[slot].next)
+                if (!visit(index_->slots_[slot].handle)) return;
+    }
+
+    // Aggregate externally priced degradation using the same exact semantic forest.
+    // Equivalent aliases contribute the maximum capability loss, never their count.
+    template <class Value>
+    std::uint64_t aggregate(std::span<const Handle> targets, Value value) {
+        prepare({}, {});
+        for (auto target : targets) {
+            const auto loss = value(target);
+            if (!loss) continue;
+            const auto node = require_node(target);
+            if (score_stamp_[node] != stamp_) {
+                score_stamp_[node] = stamp_;
+                values_[node]      = loss;
+                groups_.push_back(node);
+            } else
+                values_[node] = std::max(values_[node], loss);
+        }
+        std::sort(groups_.begin(), groups_.end(), [&](auto a, auto b) {
+            return index_->nodes_[a].begin < index_->nodes_[b].begin;
+        });
+        stack_.clear();
+        std::uint64_t total = 0;
+        const auto add      = [&](std::uint64_t value) {
+            total = value > UINT64_MAX - total ? UINT64_MAX : total + value;
+        };
+        for (auto node : groups_) {
+            while (!stack_.empty() &&
+                   index_->nodes_[stack_.back().node].end <= index_->nodes_[node].begin) {
+                if (stack_.back().leaf) add(stack_.back().worst);
+                stack_.pop_back();
+            }
+            auto worst = values_[node];
+            if (!stack_.empty()) {
+                worst              = std::max(worst, stack_.back().worst);
+                stack_.back().leaf = false;
+            }
+            stack_.push_back({node, worst, true});
+        }
+        for (const auto& path : stack_)
+            if (path.leaf) add(path.worst);
+        return total;
+    }
+
+    // Removing checkpoints on disjoint branches has additive recovery loss. This set tracks
+    // ancestor overlap without comparing every trial with every previously removed point.
+    class OverlapSet {
+    public:
+        explicit OverlapSet(const RecoveryEvaluation& evaluation) : evaluation_(&evaluation) {}
+
+        [[nodiscard]] bool intersects(std::span<const Handle> handles) const {
+            for (const auto handle : handles) {
+                const auto region = region_of(handle);
+                const auto it     = first_overlap(region.first);
+                if (it != regions_.end() && it->first < region.second) return true;
+            }
+            return false;
+        }
+
+        void include(std::span<const Handle> handles) {
+            for (const auto handle : handles) {
+                auto region = region_of(handle);
+                auto first = first_overlap(region.first), last = first;
+                while (last != regions_.end() && last->first < region.second) {
+                    region.first  = std::min(region.first, last->first);
+                    region.second = std::max(region.second, last->second);
+                    ++last;
+                }
+                regions_.insert(regions_.erase(first, last), region);
+            }
+        }
+
+    private:
+        std::pair<std::uint32_t, std::uint32_t> region_of(Handle handle) const {
+            evaluation_->check();
+            const auto& node = evaluation_->index_->nodes_[evaluation_->require_node(handle)];
+            return {node.begin, node.end};
+        }
+
+        auto first_overlap(std::uint32_t begin) const {
+            return std::lower_bound(
+                regions_.begin(), regions_.end(), begin,
+                [](const auto& region, auto value) { return region.second <= value; });
+        }
+
+        const RecoveryEvaluation* evaluation_;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> regions_;
+    };
+
+    // A previously removed ancestor can share loss between effective branches. Include its
+    // subtree even when redundant removed aliases obscure the effective forest's leaves.
+    [[nodiscard]] OverlapSet dependencies(std::span<const Handle> removed,
+                                          std::span<const Handle> additions) const {
+        OverlapSet result(*this);
+        result.include(additions);
+        for (const auto added : additions)
+            for (const auto h : removed)
+                if (prefix(h, added)) result.include(std::span<const Handle>(&h, 1));
+        return result;
+    }
+
     [[nodiscard]] std::uint64_t loss(std::span<const Handle> removed,
                                      std::span<const Handle> unavailable = {}) {
         prepare(removed, unavailable);
@@ -425,8 +547,8 @@ public:
             return index_->nodes_[a].begin < index_->nodes_[b].begin;
         });
 
-        // The stack is the virtual forest induced by removed nodes. Propagate the maximum
-        // degradation along each path; count it only at that path's deepest removed node.
+        // Only effective degradation creates a loss branch. Removing a redundant alias must
+        // not split an ancestor's loss while the same recovery capability survives.
         auto& stack = stack_;
         stack.clear();
         std::uint64_t total = 0;
@@ -436,7 +558,8 @@ public:
                 if (stack.back().leaf) total += stack.back().worst;
                 stack.pop_back();
             }
-            auto worst = record.frontier - fallback(node);
+            std::uint64_t worst = record.frontier - fallback(node);
+            if (!worst) continue;
             if (!stack.empty()) {
                 worst             = std::max(worst, stack.back().worst);
                 stack.back().leaf = false;
@@ -561,7 +684,7 @@ private:
     std::uint64_t epoch_, stamp_ = 0;
     std::span<std::uint8_t> advertised_;
     std::span<std::uint32_t> available_, nearest_, removed_, memo_;
-    std::span<std::uint64_t> handle_stamp_, node_stamp_, memo_stamp_, score_stamp_;
+    std::span<std::uint64_t> handle_stamp_, node_stamp_, memo_stamp_, score_stamp_, values_;
     List<std::uint32_t> groups_, path_;
     List<Path> stack_;
     Work work_;

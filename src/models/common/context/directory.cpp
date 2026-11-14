@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <map>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -57,6 +58,7 @@ void finalize_mappings(ContextActions& actions) {
     };
 
     std::vector<RowUpdates> rows;
+    std::map<std::pair<std::uint32_t, std::int32_t>, std::size_t> row_index;
     ContextActions ordered;
     ordered.operations.reserve(actions.operations.size());
     for (auto& action : actions.operations) {
@@ -66,14 +68,10 @@ void finalize_mappings(ContextActions& actions) {
             continue;
         }
         if (update->offsets.empty()) continue;
-        auto row = std::find_if(rows.begin(), rows.end(), [&](const auto& existing) {
-            return existing.pool_id == update->pool_id && existing.row == update->row;
-        });
-        if (row == rows.end()) {
-            rows.push_back({update->pool_id, update->row, {}});
-            row = rows.end() - 1;
-        }
-        auto& ranges         = row->ranges;
+        const auto [row, inserted] =
+            row_index.try_emplace({update->pool_id, update->row}, rows.size());
+        if (inserted) { rows.push_back({update->pool_id, update->row, {}}); }
+        auto& ranges         = rows[row->second].ranges;
         const auto new_begin = update->logical_begin;
         const auto new_end   = new_begin + update->offsets.size();
         auto first           = std::lower_bound(ranges.begin(), ranges.end(), new_begin,
@@ -520,33 +518,10 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
     const auto releases = normalized_releases(released.records);
     result.placement    = records_.assess(requests, releases);
     result.status       = ContextAvailability::Ready;
-    for (const auto& rank : spec_.ranks) {
-        std::vector<RecordSpec> specs;
-        for (const auto& layout : record_layouts(spec_))
-            for (const auto& part : layout.parts)
-                if (part.rank == rank.rank) specs.push_back(part.record);
-        const auto geometry = describe_context_pool(specs);
-        for (const auto memory : {ContextMemory::Device, ContextMemory::Host}) {
-            std::vector<RecordRequest> local;
-            for (const auto& request : requests) {
-                if (request.memory != memory || !request.count) continue;
-                if (!request.ranks.empty() && std::find(request.ranks.begin(), request.ranks.end(),
-                                                        rank.rank) == request.ranks.end())
-                    continue;
-                const auto& layout = records_.layout(request.layout);
-                const auto part =
-                    std::find_if(layout.parts.begin(), layout.parts.end(),
-                                 [&](const auto& value) { return value.rank == rank.rank; });
-                if (part == layout.parts.end()) continue;
-                const auto index =
-                    std::find(specs.begin(), specs.end(), part->record) - specs.begin();
-                local.push_back({geometry.spec_classes[index], request.count});
-            }
-            if (geometry.required_bytes(local) >
-                records_.pool({rank.rank, memory}).capacity_bytes()) {
-                result.status = ContextAvailability::Impossible;
-                return result;
-            }
+    for (const auto& domain : result.placement.domains) {
+        if (domain.minimum_bytes > records_.pool(domain.domain).capacity_bytes()) {
+            result.status = ContextAvailability::Impossible;
+            return result;
         }
     }
 
@@ -722,6 +697,34 @@ std::size_t ContextDirectory::useful_release_bytes(const ContextReleaseSet& rele
     return useful;
 }
 
+std::vector<std::uint64_t>
+ContextDirectory::release_limits(const ContextAssessment& assessment) const {
+    std::vector<std::uint64_t> result;
+    for (const auto& domain : assessment.placement.domains)
+        if (domain.placement.status != PoolAvailability::Ready)
+            result.push_back(domain.placement.reclaim_bytes);
+    return result;
+}
+
+runtime::ContextReleaseMeasure
+ContextDirectory::release_measure(const ContextReleaseSet& release,
+                                  const ContextAssessment& assessment) const {
+    runtime::ContextReleaseMeasure result;
+    const auto records = normalized_releases(release.records);
+    for (const auto& domain : assessment.placement.domains) {
+        if (domain.placement.status == PoolAvailability::Ready) continue;
+        std::uint64_t bytes = 0;
+        for (const auto& record : records)
+            if (record.domain == domain.domain)
+                bytes += records_.pool(record.domain).resolve(record.allocation).bytes;
+        result.bytes.push_back(bytes);
+    }
+    if (assessment.metadata_shortage)
+        result.metadata_objects = release.states.size() + release.pages.size() +
+                                  release.histories.size() + release.catalog.size();
+    return result;
+}
+
 ContextReleaseSet ContextDirectory::state_release(StateId image) const {
     return {.records = states_.allocations(image), .states = {image}};
 }
@@ -794,6 +797,38 @@ ContextUsage ContextDirectory::usage() const {
             value.tail_bytes               = usage.tail_bytes;
             value.peak_occupied_bytes      = usage.peak_occupied_bytes;
             result.pools.push_back(value);
+            const auto add = [&](ninfer::ContextResourceUsage& into, std::uint32_t layout) {
+                const auto& records = records_.usage({rank.rank, memory}, layout);
+                into.live_records += records.live_records;
+                into.live_bytes += records.live_records * records.stride_bytes;
+                const auto cached = records.cached_records * records.stride_bytes;
+                const auto in_use =
+                    (records.live_records - records.cached_records) * records.stride_bytes;
+                into.cached_bytes += cached;
+                into.in_use_bytes += in_use;
+                result.pools.back().cached_bytes += cached;
+                result.pools.back().in_use_bytes += in_use;
+                into.pending_retirement_records += records.pending_retirement_records;
+                into.pending_retirement_bytes +=
+                    records.pending_retirement_records * records.stride_bytes;
+            };
+            ninfer::ContextResourceUsage state{.rank = rank.rank, .domain = value.domain};
+            for (const auto& layout : spec_.state.layouts)
+                if (std::any_of(layout.parts.begin(), layout.parts.end(),
+                                [&](const auto& part) { return part.rank == rank.rank; }))
+                    add(state, state_record_layout(layout.variant));
+            result.resources.push_back(state);
+            for (const auto& history : spec_.pools) {
+                if (std::none_of(history.parts.begin(), history.parts.end(),
+                                 [&](const auto& part) { return part.rank == rank.rank; }))
+                    continue;
+                ninfer::ContextResourceUsage kv{.rank   = rank.rank,
+                                                .domain = value.domain,
+                                                .history_pool =
+                                                    static_cast<std::uint16_t>(history.pool_id)};
+                add(kv, history.pool_id + 1);
+                result.resources.push_back(kv);
+            }
         }
     result.metadata      = {spec_.metadata_budget_bytes,
                             metadata_.allocated() + records_.metadata_bytes(), metadata_.reserved()};
@@ -814,6 +849,7 @@ std::optional<StateId> reserve_capture_destination(ContextDirectory& directory,
     if (reserved.reservation && reserved.reservation->ready())
         return directory.states().reserve_destination(reserved.reservation->take(device_id),
                                                       variant);
+    reserved.reservation.reset();
     ContextDemand host_demand;
     const auto host_id = host_demand.add_state(
         {.count = 1, .variant = variant, .logical_count = 1, .memory = ContextMemory::Host});

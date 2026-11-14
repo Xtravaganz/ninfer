@@ -3,6 +3,8 @@ add_library(ninfer_model_loading STATIC
   registry.cpp
   common/frontend/resources.cpp
   common/bindings.cpp
+  common/dflash/config.cpp
+  common/dflash/weights.cpp
   common/parallel.cpp
   common/parallel_weights.cpp
   common/vision/resources.cpp
@@ -27,6 +29,7 @@ target_compile_definitions(ninfer_model_loading PUBLIC
 
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC
+  common/batch.cpp
   common/token_input.cpp
   common/frontend/chat_template.cpp
   common/frontend/prompt.cpp

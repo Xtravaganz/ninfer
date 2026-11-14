@@ -45,6 +45,8 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
+    // Zero for an empty handle or an immediate zero-output result with no scheduled request.
+    [[nodiscard]] std::uint64_t request_id() const noexcept;
 
     // Waits for initial admission or successful completion without execution. Errors and
     // cancellation are reported before returning. Does not consume output or the handle;
@@ -115,8 +117,13 @@ public:
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] const EngineDescription& description() const;
     [[nodiscard]] const StartupReport& startup_report() const;
-    [[nodiscard]] EngineSnapshot snapshot() const;
+    [[nodiscard]] EngineSnapshot snapshot(SnapshotOptions options = {}) const;
     [[nodiscard]] bool is_available() const;
+
+    // Idempotent, thread-safe stop request. Rejects new work immediately. The worker
+    // terminates generation requests after draining their device consumers; accepted
+    // scoring work finishes before stopping. Handles remain valid for collecting results.
+    void request_stop() noexcept;
 
     // Synchronous boundaries on the execution thread. Previously submitted requests and their
     // cleanup complete before the boundary; concurrent submissions wait until it finishes.

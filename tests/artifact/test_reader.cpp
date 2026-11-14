@@ -94,8 +94,17 @@ void geometry_and_views() {
     WeightView fp8_rows{{128, 64}, {{&fp8_parent, 0, 128 * 64}}};
     require(weight_row_planes(fp8_rows.parts.front()).scales == fp8.data() + 16384,
             "FP8 view recomputed the parent scale base");
-    rejects<std::invalid_argument>([&] { (void)native_weight(fp8_rows); },
-                                   "complete-parent ABI accepted an FP8 submatrix");
+    const auto prefix = native_weight(fp8_rows);
+    require(prefix.n == 128 && prefix.k == 64 && prefix.qdata == fp8.data() &&
+                prefix.scales == fp8.data() + 16384 && prefix.scale_ne[0] == 128 &&
+                prefix.payload == fp8.data() && prefix.payload_bytes == fp8_parent.geometry.bytes,
+            "native FP8 prefix lost its logical geometry or parent backing");
+    const auto suffix = native_weight(WeightView{{128, 64}, {{&fp8_parent, 128 * 64, 256 * 64}}});
+    require(suffix.qdata == fp8.data() + 8192 && suffix.scales == fp8.data() + 16384 + 256,
+            "native FP8 row view lost parent-relative codes/scales");
+    rejects<std::invalid_argument>(
+        [&] { (void)native_weight(WeightView{{128, 32}, {{&fp8_parent, 0, 128 * 32}}}); },
+        "native FP8 view accepted partial K");
 
     std::vector<std::byte> nvfp4(4612);
     const std::array divisors{2.0F};
@@ -112,14 +121,14 @@ void geometry_and_views() {
     const WeightView complete{{128, 64}, {{&nv_parent, 0, 128 * 64}}};
     const auto query   = native_weight(complete, 3.0F);
     const auto context = native_weight(complete, 4.0F);
-    require(query.weight_scale_divisor == 2 && query.input_scale_divisor == 3 &&
-                context.input_scale_divisor == 4 && nv_parent.weight_divisors[0] == 2,
+    require(query.weight_scale == 2 && query.input_scale == 3 && context.input_scale == 4 &&
+                nv_parent.matrix_scales[0] == 2,
             "per-use native parameters changed the parent");
 
     const auto paged = weight_geometry(QType::NF4_G16_E4M3FN, QuantLayout::RowPagedG16_4K,
                                        std::array<std::uint64_t, 2>{46, 160});
     require(paged.alignment == 4096 && paged.row_bytes == 90 && paged.rows_per_page == 45 &&
-                paged.page_count == 2 && paged.divisor_offset == 8192 && paged.bytes == 8196,
+                paged.page_count == 2 && paged.matrix_scale_offset == 8192 && paged.bytes == 8196,
             "NF4 paged geometry differs from its wire representation");
     require(weight_paged_row_offset(paged, 44) == 3960 &&
                 weight_paged_row_offset(paged, 45) == 4096 &&
@@ -140,16 +149,16 @@ void bank_geometry_and_views() {
     const auto geometry =
         weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4, shape);
     require(geometry.code_bytes == 49152 && geometry.scale_offset == 49152 &&
-                geometry.scale_bytes == 6144 && geometry.divisor_offset == 55296 &&
-                geometry.divisor_count == 3 && geometry.bytes == 55308,
+                geometry.scale_bytes == 6144 && geometry.matrix_scale_offset == 55296 &&
+                geometry.matrix_scale_count == 3 && geometry.bytes == 55308,
             "NVFP4 bank planes or divisor count differ from the wire layout");
     std::vector<std::byte> payload(geometry.bytes);
     const std::array divisors{2.0F, 3.0F, 5.0F};
     const WeightParent parent{geometry, Device::cpu(), payload.data(), divisors};
     const auto second_up = native_weight({{128, 128}, {{&parent, 384 * 128, 512 * 128}}}, 7);
     require(second_up.qdata == payload.data() + 24576 &&
-                second_up.scales == payload.data() + 52224 && second_up.weight_scale_divisor == 3 &&
-                second_up.input_scale_divisor == 7 && second_up.payload == payload.data() &&
+                second_up.scales == payload.data() + 52224 && second_up.weight_scale == 3 &&
+                second_up.input_scale == 7 && second_up.payload == payload.data() &&
                 second_up.payload_bytes == 55308 &&
                 second_up.layout == QuantLayout::BlockScaleK16M128x4,
             "NVFP4 bank slice lost local planes, divisor or backing extent");
@@ -164,8 +173,8 @@ void bank_geometry_and_views() {
     rejects<std::invalid_argument>(
         [&] { (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape); },
         "single-matrix NVFP4 layout accepted a bank");
-    auto invalid            = parent;
-    invalid.weight_divisors = std::span(divisors).first(1);
+    auto invalid          = parent;
+    invalid.matrix_scales = std::span(divisors).first(1);
     rejects<std::invalid_argument>(
         [&] { (void)native_weight({{256, 128}, {{&invalid, 256 * 128, 512 * 128}}}); },
         "NVFP4 accepted missing bank divisor metadata");

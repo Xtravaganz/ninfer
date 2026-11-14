@@ -77,7 +77,7 @@ struct IndexerFixture {
           keys(initialize_history ? std::size_t(physical_pages) * 16 * 128 : 0),
           workspace_bytes(ops::kpool_indexer_workspace_capacity_bytes(
               {32, 128}, index_format, envelope, B, 1, T, cuda.multiprocessor_count())) {
-        if (T <= 0 || B < 1 || B > 8 || E < 0 || E > 1048576 || (E && E < T))
+        if (T <= 0 || B < 1 || E < 0 || E > 1048576 || (E && E < T))
             throw std::invalid_argument("Indexer fixture T/B/end");
         plane_index = packed.plane_index(cache.keys.plane);
         if (index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
@@ -137,6 +137,39 @@ struct IndexerFixture {
         valid.upload();
         selectors.upload();
         tables.upload();
+    }
+
+    // Reuse the same physical histories and allocation addresses across a token
+    // sweep. Only contiguous query/selection views and live metadata change.
+    void reset_tokens(int tokens, bool ragged, CudaExecutionView cuda) {
+        if (tokens <= 0 || tokens > E || std::size_t(tokens) * B > counts.host.size())
+            throw std::invalid_argument("Indexer fixture token capacity");
+        T                  = tokens;
+        const auto reshape = [](auto& buffer, std::initializer_list<int> shape) {
+            auto view   = Tensor::metadata(buffer.view.dtype, shape);
+            view.data   = buffer.view.data;
+            view.device = buffer.view.device;
+            buffer.view = view;
+        };
+        reshape(query, {128, 32, T, B});
+        reshape(coeff, {32, T, B});
+        reshape(positions, {T, B});
+        reshape(ids, {512, T * B});
+        reshape(counts, {T * B});
+        reshape(ends, {T * B});
+        for (int b = 0; b < B; ++b) {
+            const int n     = ragged && b == B - 1 ? 0 : ragged ? std::max(1, T - b) : T;
+            valid.at(b)     = n;
+            selectors.at(b) = n ? B - 1 - b : -1;
+            for (int t = 0; t < T; ++t) positions.at(t, b) = t < n ? E - T + t : -1;
+        }
+        positions.upload();
+        valid.upload();
+        selectors.upload();
+        selection       = {ids.view, counts.view, ends.view};
+        workspace_bytes = ops::kpool_indexer_workspace_capacity_bytes(
+            {32, 128}, cache.format, envelope, B, 1, T, cuda.multiprocessor_count());
+        workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
     }
 
     void upload_keys() {

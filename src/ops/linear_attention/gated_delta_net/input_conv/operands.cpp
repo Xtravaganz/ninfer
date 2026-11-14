@@ -3,6 +3,7 @@
 #include "ops/common/host/operands.h"
 
 #include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -40,6 +41,8 @@ WeightProfile describe_profile(const ProjectionProfile& weights) {
     if (weights.second) {
         const auto& a = weights.first;
         const auto& b = *weights.second;
+        if (!valid_linear_policy(a.policy) || !valid_linear_policy(b.policy))
+            throw std::invalid_argument("GDN input: invalid activation permission");
         if (a.qtype != QType::Q4_G64_FP16 || b.qtype != QType::Q5_G64_FP16 || a.n != 4096 ||
             a.k != 5120 || b.n != 12288 || b.k != 5120)
             throw std::invalid_argument("GDN input: unsupported paired weight geometry");
@@ -68,7 +71,7 @@ WeightOperands describe_weights(const ProjectionWeights& weights) {
         return {profile, &single->weight, nullptr};
     }
     const auto& pair = std::get<PairedProjectionWeights>(weights);
-    return {profile, &pair.first, &pair.second};
+    return {profile, &pair.first.weight, &pair.second.weight};
 }
 
 void validate_weights(const WeightOperands& weights) {
@@ -96,7 +99,8 @@ void validate_interval(std::int32_t first, std::int32_t last) {
 void validate_batch_interval(Publication publication, std::int32_t batch, std::int32_t first,
                              std::int32_t last) {
     validate_interval(first, last);
-    if (batch < 1 || batch > 8 || (batch > 1 && last > 16) ||
+    if (batch < 1 || std::int64_t(batch) * last > std::numeric_limits<std::int32_t>::max() ||
+        (batch > 1 && last > 16) ||
         (publication == Publication::Record && (first < 2 || last > 16)))
         throw std::invalid_argument("GDN convolution: unsupported batch/token interval");
 }

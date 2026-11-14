@@ -50,19 +50,28 @@ auto fields(T& v) {
     else if constexpr (std::is_same_v<Value, CommunicationWork>)
         return std::tie(v.calls, v.payload_bytes);
     else if constexpr (std::is_same_v<Value, CommunicationStatistics>)
-        return std::tie(v.group, v.size, v.eager, v.graph, v.startup_memory);
+        return std::tie(v.group, v.size, v.backends);
+    else if constexpr (std::is_same_v<Value, CommunicationBackendStatistics>)
+        return std::tie(v.backend, v.eager, v.graph, v.memory);
     else if constexpr (std::is_same_v<Value, CommunicationMemory>)
+        return std::tie(v.owned_host_bytes, v.owned_device_bytes, v.registered_host_bytes,
+                        v.library);
+    else if constexpr (std::is_same_v<Value, LibraryCommunicationMemory>)
         return std::tie(v.tracked_device_bytes, v.persistent_device_bytes,
                         v.suspendable_device_bytes);
     else if constexpr (std::is_same_v<Value, RankHostStatistics>)
         return std::tie(v.submit_ns, v.progress_ns, v.supply_ns, v.commit_ns, v.discard_ns);
     else if constexpr (std::is_same_v<Value, GpuExecutionObservation>)
         return std::tie(v.result_stream_ns, v.commit_stream_ns, v.prefill_stream_ns,
-                        v.vision_stream_ns);
+                        v.vision_stream_ns, v.draft_stream_ns, v.target_stream_ns);
+    else if constexpr (std::is_same_v<Value, AttentionWorkCounters>)
+        return std::tie(v.forwards, v.rows, v.valid_positions, v.scheduled_positions);
+    else if constexpr (std::is_same_v<Value, AttentionWorkObservation>)
+        return std::tie(v.kind, v.work);
     else if constexpr (std::is_same_v<Value, RankExecutionObservation>)
         return std::tie(v.path, v.host, v.gpu, v.communication_eager, v.communication_graph,
                         v.workspace_peak_bytes, v.measurement_peak_bytes, v.expert_upload_bytes,
-                        v.ple_upload_bytes);
+                        v.ple_upload_bytes, v.attention);
     else {
         static_assert(std::is_same_v<Value, RankMemoryBudget>);
         return std::tie(v.limit_bytes, v.runtime_reservation_bytes,
@@ -128,6 +137,17 @@ void read(wire::Decoder& in, T& v) {
 }
 } // namespace
 
+ControlBudget with_communication_capacity(ControlBudget budget,
+                                          std::span<const CommunicationStatistics> communication) {
+    wire::Encoder out;
+    write(out, communication);
+    const auto extra = std::move(out).take().size() - sizeof(std::uint64_t);
+    if (extra > SIZE_MAX - budget.report)
+        throw std::overflow_error("communication observation capacity overflow");
+    budget.report += extra;
+    return budget;
+}
+
 void encode(wire::Encoder& out, const RankMemoryBudget& summary) { write(out, summary); }
 
 RankMemoryBudget memory_budget(wire::Decoder& in) {
@@ -145,6 +165,15 @@ RankSnapshot rank_snapshot(wire::Decoder& in) {
 }
 
 void encode(wire::Encoder& out, const RankExecutionObservation& value) { write(out, value); }
+
+std::size_t rank_execution_observation_capacity() {
+    RankExecutionObservation value;
+    for (const auto field : kGpuIntervalFields) value.gpu.*field = 0;
+    value.attention.emplace();
+    wire::Encoder out;
+    encode(out, value);
+    return std::move(out).take().size();
+}
 
 RankExecutionObservation rank_execution_observation(wire::Decoder& in) {
     RankExecutionObservation result;

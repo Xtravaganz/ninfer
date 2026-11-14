@@ -16,13 +16,23 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(SequenceState& state) {
     demand.add_growth(*text_kv_histories, state.kv->text.handle(), 0);
     if (state.kv->backend) demand.add_growth(*backend_kv_histories, state.kv->backend->handle(), 0);
     if (!directory.reserve(demand)) return {};
+    auto& identity_budget = recovery_metadata.identity_budget();
+    const auto identity_bytes =
+        sizeof(PreparedCaptureBacking) + std::size_t(frontier) * sizeof(TokenId) +
+        state.prefix_digests.metadata_bytes() + state.prefix_identity.metadata_bytes();
+    if (!context::IdentityMetadata::can_retain<PreparedCaptureBacking>(identity_budget,
+                                                                       identity_bytes))
+        return {};
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);
     backing->ledger.assign(state.ledger.begin(), state.ledger.begin() + frontier);
     backing->prefix_identity = state.prefix_identity;
     backing->prefix_identity.truncate(frontier);
-    return {std::move(record), std::move(backing)};
+    const std::shared_ptr<const PreparedCaptureBacking> immutable = std::move(backing);
+    auto retained = immutable->retention.retain(identity_budget, immutable);
+    if (!retained) return {};
+    return {std::move(record), std::move(retained)};
 }
 
 std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& state,
@@ -326,11 +336,17 @@ bool SessionImpl::begin_pause(SequenceHandle handle, runtime::PauseAction action
     if (save_snapshot) {
         saved->snapshot = detach_checkpoint(state, std::move(pause_reservation_->checkpoint));
         if (!saved->snapshot) throw std::logic_error("prepared pause lost its complete checkpoint");
+        checkpoint(*saved->snapshot)
+            .snapshot.set_use(context::ContextUse::Request,
+                              action.kind == runtime::PauseKind::HostSnapshot
+                                  ? context::ContextMemory::Host
+                                  : context::ContextMemory::Device);
     }
     if (!saved->snapshot) {
         release_sequence_kv(state);
         release_sequence_state(state);
     }
+    resident_sequences.erase(state.id.value);
     saved->sequence    = std::move(state);
     saved->control     = std::move(control);
     state              = {};

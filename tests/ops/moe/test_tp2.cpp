@@ -1,4 +1,5 @@
 #include "ops/moe/tp2_fixture.h"
+#include "ops/moe/native_fixture.h"
 #include "ops/op_tester.h"
 #include "ops/suite.h"
 #include "core/decode_graph.h"
@@ -27,6 +28,7 @@ struct Case {
     DType output_type = DType::BF16;
     bool shared_only  = false;
     bool masked       = false;
+    bool padded       = false;
 };
 
 std::size_t capacity(const Fixture& fixture, bool complete, int first, int last,
@@ -82,13 +84,18 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
         fixture.shape.clamped ? ops::MoeWeights{} : fixture.softmax_weights();
     const auto x      = fixture.x(c.tokens);
     const auto routes = fixture.routes(c.tokens);
+    std::vector<int> columns(c.padded ? c.tokens / 2 : 0);
+    auto valid = to_device(columns);
+    const ops::MoeTokenValidity validity{
+        c.padded ? Tensor(valid.span(), DType::I32, {int(columns.size())}) : Tensor{}, 2};
     const auto launch = [&] {
         if (c.complete) {
             if (fixture.shape.clamped)
-                ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, subset, y, workspace, cuda);
+                ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, subset, y, validity,
+                                             workspace, cuda);
             else
                 ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, subset,
-                                             ops::MoeEpilogue::Write, y, workspace, cuda);
+                                             ops::MoeEpilogue::Write, y, validity, workspace, cuda);
         } else
             ops::routed_swiglu(x, profile, experts, routes, subset, ops::MoeEpilogue::Write, y,
                                workspace, cuda);
@@ -103,6 +110,8 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
     }
     int failures = 0;
     for (int phase = 0; phase < (c.transition ? 4 : c.graph ? 2 : 1); ++phase) {
+        for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + phase) % 3;
+        if (c.padded) valid.copy_from_host(columns.data(), valid.size());
         update_mask(phase);
         const auto distribution = c.transition && phase == 1   ? "tail"
                                   : c.transition && phase == 2 ? "spread"
@@ -132,12 +141,21 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                 throw std::runtime_error("TP2 FP32 output has non-finite or unwritten cells");
         }
         std::vector<std::uint16_t> preserved(fixture.input_words().size());
+        if (c.padded)
+            for (int token = 0; token < c.tokens; ++token) {
+                if (token % 2 < columns[token / 2]) continue;
+                for (int row = 0; row < fixture.shape.hidden; ++row) {
+                    const auto i = std::size_t(token) * fixture.shape.hidden + row;
+                    if (c.output_type == DType::BF16 ? words[i] != 0 : floats[i] != 0) ++failures;
+                }
+            }
         CUDA_CHECK(
             cudaMemcpy(preserved.data(), x.data, preserved.size() * 2, cudaMemcpyDeviceToHost));
         if (preserved != fixture.input_words()) throw std::runtime_error("TP2 input was modified");
         Oracle oracle(fixture);
         std::vector<double> got, reference;
-        const std::set<int> tokens{0, c.tokens - 1};
+        std::set<int> tokens{0, c.tokens - 1};
+        if (c.distribution == "partial") tokens.insert(1);
         std::set<int> rows{0,
                            1,
                            63,
@@ -195,7 +213,9 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                 const auto index = std::size_t(token) * fixture.shape.hidden + row;
                 got.push_back(c.output_type == DType::BF16 ? bf16_to_f32(words[index])
                                                            : floats[index]);
-                reference.push_back(oracle.output(row, token, c.complete, true, mask));
+                reference.push_back(c.padded && token % 2 >= columns[token / 2]
+                                        ? 0
+                                        : oracle.output(row, token, c.complete, true, mask));
             }
         }
         failures += verify_reduction(label, got, reference,
@@ -240,11 +260,11 @@ int test_composition(Shape shape) {
         Tensor y(output.span(), DType::BF16, {shape.hidden, tokens});
         if (shape.clamped)
             ops::topk_sigmoid_swiglu_moe(fixture.x(tokens), fixture.sigmoid_profile(),
-                                         fixture.sigmoid_weights(), {}, y, workspace, cuda);
+                                         fixture.sigmoid_weights(), {}, y, {}, workspace, cuda);
         else
             ops::topk_softmax_swiglu_moe(fixture.x(tokens), fixture.softmax_profile(),
                                          fixture.softmax_weights(), {}, ops::MoeEpilogue::Write, y,
-                                         workspace, cuda);
+                                         {}, workspace, cuda);
         CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
         std::vector<std::uint16_t> words(std::size_t(shape.hidden) * tokens);
         output.copy_to_host(words.data(), words.size() * 2);
@@ -310,6 +330,19 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
     for (int rank : {0, 1}) {
         std::vector<Case> cases;
         std::vector<OpCase> catalogue;
+        if (rank == 0) {
+            cases.push_back({.tokens       = 18,
+                             .rank         = rank,
+                             .complete     = true,
+                             .graph        = true,
+                             .stress       = false,
+                             .distribution = "pool",
+                             .padded       = true});
+            catalogue.push_back({"tp2/" + name + "/complete/rank0/validity",
+                                 {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
+                                  {"execution", "graph"},
+                                  {"suite", "concurrency"}}});
+        }
         for (bool complete : {false, true})
             for (std::size_t i = 0; i < extents.size(); ++i) {
                 if (rank == 1 && extents[i] != 1 && extents[i] != 129 && extents[i] != 4097)
@@ -350,13 +383,25 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
             catalogue.push_back({"tp2/" + name + "/complete/rank0/route-population/T513",
                                  {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
         }
-        if (rank == 0 && !shape.clamped && shape.format != QType::NVFP4)
+        if (rank == 0 && !shape.clamped)
             for (bool complete : {false, true}) {
-                cases.push_back({4096, rank, complete, true, false, "reuse", true});
+                const bool nvfp4 = shape.format == QType::NVFP4;
+                for (int t : nvfp4 ? std::vector<int>{2048, 4096} : std::vector<int>{4096}) {
+                    cases.push_back({t, rank, complete, true, false, "reuse", true});
+                    catalogue.push_back({"tp2/" + name + "/" + (complete ? "complete" : "routed") +
+                                             "/rank0/route-population/T" + std::to_string(t),
+                                         {{"format", nvfp4 ? "nvfp4" : "fp8"},
+                                          {"policy", nvfp4 ? "a4" : "a8"},
+                                          {"execution", "graph"}}});
+                }
+            }
+        if (rank == 0 && !shape.clamped && shape.format == QType::NVFP4)
+            for (bool complete : {false, true}) {
+                cases.push_back({2049, rank, complete, true, false, "partial"});
                 catalogue.push_back(
                     {"tp2/" + name + "/" + (complete ? "complete" : "routed") +
-                         "/rank0/route-population/T4096",
-                     {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
+                         "/rank0/partial-hot/T2049",
+                     {{"format", "nvfp4"}, {"policy", "a4"}, {"execution", "graph"}}});
             }
         if (rank == 0)
             for (bool complete : {false, true}) {
@@ -424,5 +469,6 @@ int main(int argc, char** argv) {
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM2, "m2");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM3, "m3");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM4, "m4");
+    ninfer::test::native_moe::add_native_cases(suite);
     return suite.main(argc, argv);
 }

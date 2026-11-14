@@ -19,16 +19,13 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
         definition.resources().text.public_token_count,
         definition.options().mtp(),
         definition.options().vision,
-        static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())};
+        static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
+        p.batches};
     const auto payloads = contract.payload_capacity(scope.owners.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
-    wire::Encoder completion;
-    RankExecutionObservation observed;
-    observed.gpu = {0, 0, 0, 0};
-    runtime::protocol::encode(completion, observed);
     const auto event =
-        std::move(completion).take().size() + 96 +
+        runtime::protocol::rank_execution_observation_capacity() + 96 +
         std::max<std::size_t>({batch * (64 + 4 * positions), 4ULL * s.prefill_chunk + 64,
                                40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
@@ -54,7 +51,8 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
     for (auto& pool : plan.session.context.pools) pool.parts.clear();
     for (const auto& rank : ranks) {
         const auto& session = rank.session;
-        if (session.shape != plan.session.shape ||
+        if (session.shape != plan.session.shape || !session.batches || !plan.session.batches ||
+            session.batches->spec() != plan.session.batches->spec() ||
             session.checkpoint_interval != plan.session.checkpoint_interval ||
             session.vision_max_features != plan.session.vision_max_features ||
             session.context.pools.size() != plan.session.context.pools.size())
@@ -99,7 +97,8 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 definition.resources().text.public_token_count,
                 definition.options().mtp(),
                 definition.options().vision,
-                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())} {
+                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
+                rank.session.batches} {
     rank_               = rank.observation.rank;
     ranks_              = topology.ranks.size();
     max_features_       = rank.session.vision_max_features;
@@ -108,12 +107,6 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     scope_.validate(topology);
     auto described = rank;
     described.observation.communication.clear();
-    for (const auto& group : topology.groups) {
-        if (std::find(group.members.begin(), group.members.end(), rank.observation.rank) !=
-            group.members.end())
-            described.observation.communication.push_back(
-                {group.id, static_cast<std::uint32_t>(group.members.size())});
-    }
     budget_ = qwen4_exp::control_budget(definition, described, scope_);
 }
 

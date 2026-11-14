@@ -4,6 +4,9 @@
 
 #include "ops/linear/swiglu/fp8/dispatch.h"
 #include "ops/linear/swiglu/nvfp4/dispatch.h"
+#include "ops/linear/swiglu/fp8_block/dispatch.h"
+#include "ops/linear/swiglu/mxfp8/dispatch.h"
+#include "ops/linear/swiglu/nvfp4_mul/dispatch.h"
 #include "ops/linear/swiglu/dispatch.h"
 #include "ops/linear/common/operands.h"
 #include "ops/common/host/operands.h"
@@ -25,6 +28,13 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
 }
 
+void validate_output_aliases(const Tensor& x, const Weight& weight, const Tensor& out) {
+    using namespace common::operand;
+    constexpr auto op = "linear_swiglu";
+    disjoint(range(x, op), range(out, op), op);
+    disjoint(range(weight.payload, weight.payload_bytes, op), range(out, op), op);
+}
+
 } // namespace
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -38,11 +48,24 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     detail::validate_swiglu_geometry(qtype, gate_up_rows, input_rows);
     if (qtype == QType::BF16) return 0;
     if (qtype == QType::Q8_G32_FP16) return 0;
+    if (qtype == QType::MXFP8)
+        return detail::mxfp8_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                             min_tokens, max_tokens);
+    if (qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
+        return detail::fp8_block_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
+    if (qtype == QType::NVFP4_MUL)
+        return detail::nvfp4_mul_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
     if (qtype == QType::Q4_G64_FP16) {
         return detail::q4_linear_swiglu_capacity_workspace_bytes(gate_up_rows, input_rows,
                                                                  min_tokens, max_tokens);
     }
     if (qtype == QType::NVFP4) {
+#if NINFER_TARGET_RTX5090
+        if (gate_up_rows == 28672 && input_rows == 5120)
+            return detail::nvfp4_swiglu_n28672_k5120_capacity(policy, min_tokens, max_tokens);
+#endif
 #if NINFER_TARGET_SPARK
         if (gate_up_rows == 12288 && input_rows == 4096)
             return detail::nvfp4_swiglu_n12288_k4096_capacity(policy, min_tokens, max_tokens);
@@ -87,6 +110,21 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
         !common::operand::aligned(out.data, 16))
         throw std::invalid_argument("linear_swiglu: x/out must be contiguous and 16-byte aligned");
 
+    if (w.qtype == QType::MXFP8 || w.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ||
+        w.qtype == QType::NVFP4_MUL) {
+        detail::validate_projection_operands(x, w, {&out, 1}, nullptr, execution, "linear_swiglu");
+        if (w.qtype == QType::MXFP8)
+            detail::mxfp8_swiglu_dispatch(x, w, out, limit, clamped, policy, ws,
+                                          execution.stream());
+        else if (w.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
+            detail::fp8_block_swiglu_dispatch(x, w, out, limit, clamped, policy,
+                                              execution.stream());
+        else
+            detail::nvfp4_mul_swiglu_dispatch(x, w, nullptr, out, limit, clamped, policy,
+                                              execution.stream());
+        return;
+    }
+
 #if NINFER_TARGET_SPARK
     if (w.qtype == QType::BF16) {
         detail::validate_bf16_projection(x, w, {&out, 1}, nullptr, execution, "linear_swiglu");
@@ -108,12 +146,20 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
 
     if (fp8_weight) {
         (void)common::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
+        validate_output_aliases(x, gate_up_weight, out);
         detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, execution.stream());
         return;
     }
 
     if (nvfp4_weight) {
         (void)common::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        validate_output_aliases(x, gate_up_weight, out);
+#if NINFER_TARGET_RTX5090
+        if (w.n == 28672 && w.k == 5120) {
+            detail::launch_nvfp4_swiglu_n28672_k5120(x, w, out, policy, ws, execution.stream());
+            return;
+        }
+#endif
 #if NINFER_TARGET_SPARK
         if (w.n == 12288 && w.k == 4096) {
             detail::launch_nvfp4_swiglu_n12288_k4096(x, w, out, limit, clamped, policy, ws,

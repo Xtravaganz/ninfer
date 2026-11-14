@@ -54,6 +54,25 @@ Json budget_json(const RankMemoryBudget& b) {
 }
 } // namespace
 
+const char* communication_backend_name(CommunicationBackend backend) {
+    switch (backend) {
+    case CommunicationBackend::Nccl:
+        return "nccl";
+    case CommunicationBackend::Native:
+        return "native";
+    }
+    throw std::logic_error("invalid communication backend observation");
+}
+
+Json communication_json(const CommunicationWork& value) {
+    constexpr std::array names{"all_reduce",     "broadcast", "all_gather",
+                               "reduce_scatter", "send",      "receive"};
+    Json out;
+    for (std::size_t i = 0; i < names.size(); ++i)
+        out[names[i]] = {{"calls", value.calls[i]}, {"payload_bytes", value.payload_bytes[i]}};
+    return out;
+}
+
 double seconds(std::uint64_t ns) noexcept { return static_cast<double>(ns) * 1e-9; }
 
 const char* context_domain_name(ContextMemoryDomain domain) noexcept {
@@ -78,6 +97,8 @@ Json context_usage_json(const RuntimeStats& stats) {
                          {"capacity_bytes", pool.capacity_bytes},
                          {"block_bytes", pool.block_bytes},
                          {"live_bytes", pool.live_bytes},
+                         {"in_use_bytes", pool.in_use_bytes},
+                         {"cached_bytes", pool.cached_bytes},
                          {"reserved_bytes", pool.reserved_bytes},
                          {"pending_retirement_bytes", pool.pending_retirement_bytes},
                          {"relocation_bytes", pool.relocation_bytes},
@@ -137,13 +158,12 @@ Json execution_json(const ExecutionSample& value) {
 
 Json request_execution_json(const RequestStats& value) {
     constexpr const char* names[] = {"prefill", "decode", "replay", "control", "score", "context"};
-    constexpr const char* intervals[] = {"result_stream", "commit_stream", "prefill_stream",
-                                         "vision_stream"};
+
     Json out;
     for (std::size_t i = 0; i < value.executions.size(); ++i)
         out[names[i]] = execution_json(value.executions[i]);
     for (std::size_t i = 0; i < value.max_rank_gpu.size(); ++i)
-        out["max_rank_gpu_intervals"][intervals[i]] = duration_json(value.max_rank_gpu[i]);
+        out["max_rank_gpu_intervals"][kGpuIntervalNames[i]] = duration_json(value.max_rank_gpu[i]);
     return out;
 }
 
@@ -188,15 +208,27 @@ Json resource_json(const RankSnapshot& rank) {
              {"ple", nullptr}};
     out["communication"] = Json::array();
     for (const auto& group : rank.communication) {
-        Json memory = nullptr;
-        if (group.startup_memory) {
-            const auto& value = *group.startup_memory;
-            memory            = {{"tracked_device_bytes", value.tracked_device_bytes},
-                                 {"persistent_device_bytes", value.persistent_device_bytes},
-                                 {"suspendable_device_bytes", value.suspendable_device_bytes}};
+        auto backends = Json::array();
+        for (const auto& backend : group.backends) {
+            const auto& memory = backend.memory;
+            Json library       = nullptr;
+            if (memory.library) {
+                const auto& value = *memory.library;
+                library           = {{"tracked_device_bytes", value.tracked_device_bytes},
+                                     {"persistent_device_bytes", value.persistent_device_bytes},
+                                     {"suspendable_device_bytes", value.suspendable_device_bytes}};
+            }
+            backends.push_back({{"backend", communication_backend_name(backend.backend)},
+                                {"eager", communication_json(backend.eager)},
+                                {"graph", communication_json(backend.graph)},
+                                {"memory",
+                                 {{"owned_host_bytes", memory.owned_host_bytes},
+                                  {"owned_device_bytes", memory.owned_device_bytes},
+                                  {"registered_host_bytes", memory.registered_host_bytes},
+                                  {"library", std::move(library)}}}});
         }
         out["communication"].push_back(
-            {{"group", group.group}, {"size", group.size}, {"startup_memory", std::move(memory)}});
+            {{"group", group.group}, {"size", group.size}, {"backends", std::move(backends)}});
     }
     if (rank.physical_memory) {
         const auto& p          = *rank.physical_memory;

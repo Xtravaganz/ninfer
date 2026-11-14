@@ -22,12 +22,15 @@ struct KdaConvUpdateState {
  * [source.history || p], then SiLU and split Q/K/V. Projection and convolution form one
  * computation: private p has no BF16 rounding boundary. Published outputs/history are BF16.
  *
- * x BF16 [K,T,B], Q/K/V BF16 [N/3,T,B]; registered Q8-G32-FP16 RowSplit A16 parent [N,K].
- * conv_weight FP32 [N,4], taps oldest to current. Source/destination fields BF16 [N,3],
+ * x BF16 [K,T,B], Q/K/V BF16 [N/3,T,B]. The projection accepts Q8-G32-FP16 RowSplit
+ * with A16Only and FP32 convolution weights, or MXFP8 RowGroupScale with A16Only/AllowA8
+ * and BF16 convolution weights. conv_weight [N,4] stores taps oldest to current.
+ * Source/destination fields BF16 [N,3],
  * selected by independent Device I64 [B] byte offsets, feature-contiguous, 16-byte aligned.
- * T>0, B=1..8; valid_columns is empty (n=T) or Device I32 [B], 1<=n[b]<=T.
- * Outputs are zero after n[b]; unselected fields are unchanged. Destination is the final
- * three represented projected columns, including old columns when n<3. Same-row exact
+ * T>0, B>0; valid_columns is empty (n=T) or Device I32 [B], 0<=n[b]<=T.
+ * Outputs are zero after n[b]; zero-length rows read no State selectors/history and write
+ * no history or records. Unselected fields are unchanged. For positive rows destination is the
+ * final three represented projected columns, including old columns when n<3. Same-row exact
  * in-place is allowed; destinations are distinct and cannot overwrite another row's source.
  * Other writes do not overlap accessed operands/metadata. Inputs and weights are preserved.
  *
