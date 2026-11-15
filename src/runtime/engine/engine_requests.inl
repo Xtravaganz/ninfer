@@ -25,6 +25,7 @@ void EngineCore<Instance>::wait_for_admission(const std::shared_ptr<Request>& re
         request->cancelled.store(true, std::memory_order_release);
         request_admission_check();
         queue_cv_.notify_one();
+        gpu_wake_->notify_queue();
         throw;
     }
 }
@@ -47,6 +48,7 @@ GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request>
         request->cancelled.store(true, std::memory_order_release);
         request_admission_check();
         queue_cv_.notify_one();
+        gpu_wake_->notify_queue();
     };
     std::optional<GenerationStart> start;
     bool start_delivered = false;
@@ -113,6 +115,7 @@ GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request>
                     request->cancelled.store(true, std::memory_order_release);
                     request_admission_check();
                     queue_cv_.notify_one();
+                    gpu_wake_->notify_queue();
                 }
             } catch (...) { fail_consumer(); }
         }
@@ -289,6 +292,7 @@ void EngineCore<Instance>::abandon_request(std::shared_ptr<Request> request) noe
     request->cancelled.store(true, std::memory_order_release);
     request_admission_check();
     queue_cv_.notify_one();
+    gpu_wake_->notify_queue();
     release_consumer(request);
 }
 

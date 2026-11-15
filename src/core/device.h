@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/memory.h"
+#include "core/cuda_completion_notifier.h"
 
 #include <cuda_runtime.h>
 
@@ -175,9 +176,15 @@ public:
     void wait_external(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;
+    // A retained generation cannot dangle when the CUDA completion event moves
+    // or is reused. Missing generation forces the scheduler fallback.
+    [[nodiscard]] std::shared_ptr<CudaCompletionNotifier::State::CompletionGeneration>
+    notification_generation() const noexcept { return notification_generation_; }
 
 private:
     cudaEvent_t event_ = nullptr;
+    std::shared_ptr<CudaCompletionNotifier::State::CompletionGeneration>
+        notification_generation_;
 };
 
 } // namespace ninfer

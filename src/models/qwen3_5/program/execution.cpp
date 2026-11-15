@@ -6,7 +6,67 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+void RankProgramImpl::publish_dense_completion_wait() noexcept {
+    auto channel = CudaCompletionNotifier::current();
+    if (!channel) return;
+    using State = CudaCompletionNotifier::State;
+    using Gap = State::DenseGapReason;
+    std::optional<State::DenseWaitContract> contract;
+    Gap reason = Gap::Idle;
+    unsigned compute_stage = 255;
+    // Diagnostic classification only: no changes to the actual wait contract.
+    if (!dense_completion_eligible) {
+        reason = Gap::Ineligible;
+    } else if (context_operation && compute) {
+        reason = Gap::ConcurrentFrames;
+    } else if (context_operation) {
+        auto record = context_ready.notification_generation();
+        if (record) {
+            contract.emplace(State::DenseWaitContract{
+                context_operation->request.ticket.id, State::DenseStage::ContextReady,
+                std::move(record)});
+            reason = Gap::None;
+        } else {
+            reason = Gap::MissingGeneration;
+        }
+    } else if (compute) {
+        compute_stage = static_cast<unsigned>(compute->stage);
+        std::shared_ptr<State::CompletionGeneration> record;
+        State::DenseStage stage = State::DenseStage::History;
+        reason = Gap::MissingGeneration;
+        switch (compute->stage) {
+        case ComputeStage::History:
+            record = result_ready.notification_generation();
+            stage = State::DenseStage::History;
+            break;
+        case ComputeStage::Readback:
+            record = result_ready.notification_generation();
+            stage = State::DenseStage::Readback;
+            break;
+        case ComputeStage::Retiring:
+            record = compute_retired.notification_generation();
+            stage = State::DenseStage::DeviceRetired;
+            break;
+        default:
+            reason = Gap::UnsupportedStage;
+            break;
+        }
+        if (record) {
+            contract.emplace(State::DenseWaitContract{
+                compute->request.ticket.id, stage, std::move(record)});
+            reason = Gap::None;
+        }
+    }
+    channel->publish_dense_wait(std::move(contract), reason, compute_stage);
+}
+
 void RankProgramImpl::progress() {
+    // Publish after EVERY exit, including early returns on GPU and CPU stages.
+    // Do not alter existing model state-machine transitions.
+    struct OnExit {
+        RankProgramImpl& program;
+        ~OnExit() noexcept { program.publish_dense_completion_wait(); }
+    } publish{*this};
     if (context_operation && context_ready.ready()) {
         const auto ticket    = context_operation->request.ticket;
         const auto command   = context_operation->last_command;

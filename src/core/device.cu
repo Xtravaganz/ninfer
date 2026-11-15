@@ -6,9 +6,22 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <memory>
+#include <new>
+#include <cstring>
 
 namespace ninfer {
 namespace {
+thread_local std::shared_ptr<CudaCompletionNotifier::State> tls_completion_channel;
+// The Engine thread owns all notification streams, not the shared callback State.
+// Never destroy a CUDA stream from within cudaLaunchHostFunc.
+thread_local CudaCompletionNotifier::ThreadScope* tls_notification_scope = nullptr;
+
+struct DenseNotificationPayload {
+    std::shared_ptr<CudaCompletionNotifier::State> channel;
+    std::shared_ptr<CudaCompletionNotifier::State::CompletionGeneration> generation;
+};
+
 
 struct SyncSchedule {
     std::string_view name;
@@ -61,6 +74,75 @@ void destroy_event(cudaEvent_t& event) noexcept {
 DeviceAllocationError::DeviceAllocationError(const char* operation, std::size_t requested_bytes)
     : std::runtime_error(std::string(operation) + ": insufficient Device memory"),
       requested_bytes_(requested_bytes) {}
+
+CudaCompletionNotifier::ThreadScope::ThreadScope(std::shared_ptr<State> channel)
+    : previous_(std::move(tls_completion_channel)) {
+    tls_completion_channel = std::move(channel);
+    previous_scope_ = tls_notification_scope;
+    tls_notification_scope = this;
+    // An explicit Dense-only experiment; no change to default or MoE operation.
+    const char* wanted = std::getenv("NINFER_EXPERIMENT_NOTIFY_STREAM");
+    const char* dense = std::getenv("NINFER_EXPERIMENT_EVENT_DENSE_V04");
+    notification_enabled_ = wanted && dense && std::strcmp(wanted, "1") == 0 &&
+                            std::strcmp(dense, "1") == 0;
+}
+
+cudaStream_t CudaCompletionNotifier::ThreadScope::stream_for(cudaStream_t producer) noexcept {
+    if (!notification_enabled_ || producer == nullptr) return nullptr;
+    for (std::size_t i = 0; i < stream_count_; ++i)
+        if (streams_[i].producer == producer) return streams_[i].notify;
+    auto channel = tls_completion_channel;
+    if (!channel) return nullptr;
+    if (stream_count_ == streams_.size()) {
+        channel->notify_stream_capacity_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    cudaStream_t notify = nullptr;
+    const auto created = cudaStreamCreateWithFlags(&notify, cudaStreamNonBlocking);
+    if (created != cudaSuccess) {
+        channel->notify_stream_create_errors.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    streams_[stream_count_++] = {producer, notify};
+    channel->notify_stream_created.fetch_add(1, std::memory_order_relaxed);
+    return notify;
+}
+
+CudaCompletionNotifier::ThreadScope::~ThreadScope() {
+    // The submission thread owns the streams and retires every queued host callback
+    // before destroying them. Shared callback state never owns a CUDA handle.
+    tls_notification_scope = previous_scope_;
+    auto channel = tls_completion_channel;
+    for (std::size_t i = 0; i < stream_count_; ++i) {
+        const auto synchronized = cudaStreamSynchronize(streams_[i].notify);
+        if (synchronized != cudaSuccess && channel)
+            channel->notify_sync_errors.fetch_add(1, std::memory_order_relaxed);
+        const auto destroyed = cudaStreamDestroy(streams_[i].notify);
+        if (destroyed != cudaSuccess && channel)
+            channel->notify_destroy_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (notification_enabled_ && channel) {
+        std::fprintf(stderr,
+                     "[ninfer-event-v06-teardown] streams=%zu sync_errors=%llu "
+                     "destroy_errors=%llu pending=%llu\n",
+                     stream_count_,
+                     static_cast<unsigned long long>(
+                         channel->notify_sync_errors.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         channel->notify_destroy_errors.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         channel->callbacks_pending.load(std::memory_order_relaxed)));
+    }
+    tls_completion_channel = std::move(previous_);
+}
+
+std::shared_ptr<CudaCompletionNotifier::State> CudaCompletionNotifier::current() noexcept {
+    return tls_completion_channel;
+}
+
+cudaStream_t CudaCompletionNotifier::notification_stream_for(cudaStream_t producer) noexcept {
+    return tls_notification_scope ? tls_notification_scope->stream_for(producer) : nullptr;
+}
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
@@ -314,22 +396,103 @@ CudaCompletionEvent::CudaCompletionEvent(const DeviceContext& ctx) {
 CudaCompletionEvent::~CudaCompletionEvent() { destroy_event(event_); }
 
 CudaCompletionEvent::CudaCompletionEvent(CudaCompletionEvent&& other) noexcept
-    : event_(std::exchange(other.event_, nullptr)) {}
+    : event_(std::exchange(other.event_, nullptr)),
+      notification_generation_(std::move(other.notification_generation_)) {}
 
 CudaCompletionEvent& CudaCompletionEvent::operator=(CudaCompletionEvent&& other) noexcept {
     if (this == &other) { return *this; }
     destroy_event(event_);
     event_ = std::exchange(other.event_, nullptr);
+    notification_generation_ = std::move(other.notification_generation_);
     return *this;
 }
 
 void CudaCompletionEvent::record(cudaStream_t stream) {
+    // A re-recorded event must never publish an earlier callback generation.
+    notification_generation_.reset();
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not recordable");
     }
     const auto status = cudaEventRecord(event_, stream);
     if (status != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaEventRecord failed", status));
+    }
+
+    // Experimental GPU->CPU notification for eager completion events only.
+    // cudaLaunchHostFunc is intentionally NOT inserted during CUDA Graph capture:
+    // a per-record heap token cannot safely be replayed as a graph host node.
+    auto channel = CudaCompletionNotifier::current();
+    if (!channel) return;
+    channel->completion_record_attempts.fetch_add(1, std::memory_order_relaxed);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusInvalidated;
+    const auto capture_status = cudaStreamIsCapturing(stream, &capture);
+    if (capture_status != cudaSuccess) {
+        channel->completion_capture_query_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+        channel->completion_capture_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::shared_ptr<CudaCompletionNotifier::State::CompletionGeneration> generation;
+    try {
+        generation = std::make_shared<CudaCompletionNotifier::State::CompletionGeneration>();
+    } catch (...) {
+        channel->callback_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    generation->generation =
+        channel->next_completion_generation.fetch_add(1, std::memory_order_relaxed);
+    auto* token = new (std::nothrow) DenseNotificationPayload{channel, generation};
+    if (!token) {
+        channel->callback_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // v0.6: wait for the specific recorded generation on a *separate* stream.
+    // Distinct producer streams get distinct notification streams, so a slow
+    // context transfer cannot hold a compute completion behind it (or vice versa).
+    // CUDA stream capture was excluded above. No GPU work is moved or reordered.
+    cudaStream_t callback_stream = stream;
+    bool on_notification_stream = false;
+    if (auto notify = CudaCompletionNotifier::notification_stream_for(stream)) {
+        const auto status = cudaStreamWaitEvent(notify, event_, 0);
+        if (status == cudaSuccess) {
+            channel->notify_wait_submitted.fetch_add(1, std::memory_order_relaxed);
+            callback_stream = notify;
+            on_notification_stream = true;
+        } else {
+            // Fail closed: preserve original compute-stream callback for this record.
+            channel->notify_wait_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    // Enrollment BEFORE launch prevents callbacks from racing the counter.
+    channel->callbacks_pending.fetch_add(1, std::memory_order_acq_rel);
+    const auto launched = cudaLaunchHostFunc(callback_stream, [](void* opaque) {
+        std::unique_ptr<DenseNotificationPayload> owned(
+            static_cast<DenseNotificationPayload*>(opaque));
+        const auto started = std::chrono::steady_clock::now();
+        owned->generation->delivered.store(true, std::memory_order_release);
+        owned->channel->callbacks_pending.fetch_sub(1, std::memory_order_acq_rel);
+        // A CUDA host callback may only publish a CPU wakeup; no CUDA API calls.
+        owned->channel->notify_gpu();
+        const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const auto ns = duration > 0 ? static_cast<std::uint64_t>(duration) : 0ULL;
+        owned->channel->callback_cpu_ns_total.fetch_add(ns, std::memory_order_relaxed);
+        auto peak = owned->channel->callback_cpu_ns_max.load(std::memory_order_relaxed);
+        while (peak < ns && !owned->channel->callback_cpu_ns_max.compare_exchange_weak(
+                   peak, ns, std::memory_order_relaxed)) {}
+    }, token);
+    if (launched == cudaSuccess && on_notification_stream)
+        channel->notify_callback_submitted.fetch_add(1, std::memory_order_relaxed);
+    if (launched != cudaSuccess) {
+        delete token;
+        channel->callbacks_pending.fetch_sub(1, std::memory_order_acq_rel);
+        channel->callback_failures.fetch_add(1, std::memory_order_relaxed);
+        // The bounded fallback remains active if host functions are unsupported.
+    } else {
+        notification_generation_ = std::move(generation);
+        channel->completion_callbacks_enqueued.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -344,6 +507,8 @@ void CudaCompletionEvent::wait(cudaStream_t stream) const {
 }
 
 void CudaCompletionEvent::record_external(cudaStream_t stream) {
+    // Graph-captured record nodes have no replay-safe per-launch host token.
+    notification_generation_.reset();
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not recordable");
     }
@@ -364,8 +529,16 @@ void CudaCompletionEvent::wait_external(cudaStream_t stream) const {
 bool CudaCompletionEvent::ready() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
     const cudaError_t status = cudaEventQuery(event_);
-    if (status == cudaSuccess) { return true; }
-    if (status == cudaErrorNotReady) { return false; }
+    if (status == cudaSuccess) {
+        if (auto state = CudaCompletionNotifier::current())
+            state->completion_ready_success.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (status == cudaErrorNotReady) {
+        if (auto state = CudaCompletionNotifier::current())
+            state->completion_ready_not_ready.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     throw std::runtime_error(cuda_error_message("cudaEventQuery failed", status));
 }
 

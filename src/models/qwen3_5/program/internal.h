@@ -138,6 +138,7 @@ public:
     void publish_result(ComputeOperation&);
     void retire_compute();
     void progress();
+    void publish_dense_completion_wait() noexcept;
     [[nodiscard]] ComputeOperation& require_compute(runtime::ExecutionTicket);
     [[nodiscard]] const ComputeOperation& require_compute(runtime::ExecutionTicket) const;
     [[nodiscard]] ops::SamplingConfig sampling_config(const ExecutionRow&, const SamplingInput&,
@@ -172,6 +173,7 @@ public:
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
     std::optional<Graphs> graphs;
     std::optional<GraphMemorySummary> graph_memory;
+    bool dense_completion_eligible = false;
     std::size_t workspace_lifetime_peak = 0;
 };
 

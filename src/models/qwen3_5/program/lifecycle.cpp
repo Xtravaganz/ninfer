@@ -31,6 +31,15 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
     compute_actions =
         std::make_unique<context::ContextMigration>(device, *storage, device.execution_view());
     context_actions = std::make_unique<context::ContextMigration>(device, *storage);
+    // Fail closed: event-only waits are restricted to genuine Dense Qwen3.5,
+    // no speculative backend, no vision, and the resident CUDA-graph path.
+    // MoE (even with all experts on GPU) is deliberately not eligible.
+    dense_completion_eligible = use_cuda_graph && backend == SpeculativeBackend::None &&
+        !plan.moe && !resources.vision &&
+        std::none_of(parameters.text.layers.begin(), parameters.text.layers.end(),
+                     [](const auto& block) {
+                         return std::holds_alternative<moe::Parameters>(block.ffn);
+                     });
     if (plan.moe) {
         std::vector<const moe::Parameters*> layers;
         for (const auto& block : parameters.text.layers)

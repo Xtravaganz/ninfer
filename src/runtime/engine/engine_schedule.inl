@@ -1,5 +1,10 @@
 #pragma once
 
+#include <charconv>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
+
 namespace ninfer::runtime {
 
 template <class Instance>
@@ -1133,11 +1138,68 @@ bool EngineCore<Instance>::process_measurement() {
     else
         completed->completion.set_value(std::move(result));
     queue_cv_.notify_all();
+    gpu_wake_->notify_queue();
     return true;
 }
 
 template <class Instance>
 void EngineCore<Instance>::worker_loop() noexcept {
+    // EXPERIMENT ONLY: bound how frequently the coordinator polls CUDA completion
+    // while the GPU is busy. Default 0 preserves the upstream yield-only loop.
+    // Valid values: unsigned decimal microseconds in [0, 500]. Invalid -> 0.
+    const unsigned poll_sleep_us = []() noexcept {
+        const char* raw = std::getenv("NINFER_EXPERIMENT_POLL_SLEEP_US");
+        if (raw == nullptr) return 0U;
+        const std::string_view value(raw);
+        unsigned parsed = 0;
+        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        return error == std::errc{} && end == value.data() + value.size() && parsed <= 500
+                   ? parsed
+                   : 0U;
+    }();
+    const char* dispatch_env = std::getenv("NINFER_EXPERIMENT_EVENT_DISPATCH");
+    const bool event_dispatch = dispatch_env && std::string_view(dispatch_env) == "1";
+    // An explicit opt-in; leave existing v0.2 behavior unchanged by default.
+    const char* gated_env = std::getenv("NINFER_EXPERIMENT_EVENT_GUARDED_WAIT");
+    const bool guarded_wait = event_dispatch && gated_env &&
+                              std::string_view(gated_env) == "1";
+    const char* dense_env = std::getenv("NINFER_EXPERIMENT_EVENT_DENSE_V04");
+    const bool dense_v04 = event_dispatch && dense_env &&
+                           std::string_view(dense_env) == "1";
+    std::uint64_t delivered_retry_generation = 0;
+    // v0.7: bounded progress re-checks inside the validated Dense wait contract.
+    // Keep the original v0.4 path unchanged unless a supported tick is requested.
+    const char* const v07_env = std::getenv("NINFER_EXPERIMENT_EVENT_DENSE_V07_TICK_US");
+    const std::string_view v07_value = v07_env ? std::string_view(v07_env)
+                                               : std::string_view{};
+    const unsigned dense_v07_tick_us = !dense_v04 ? 0u
+        : v07_value == "50" ? 50u
+        : v07_value == "100" ? 100u
+        : v07_value == "250" ? 250u
+        : v07_value == "500" ? 500u : 0u;
+    if (dense_v04 && v07_env && !v07_value.empty() && v07_value != "0" &&
+        dense_v07_tick_us == 0)
+        std::fprintf(stderr,
+                     "[ninfer-event-v07] unsupported tick_us=%s; using v0.4 long wait\n",
+                     v07_env);
+    // The tick must not restart the 1s failure watchdog. The owning engine
+    // thread keeps the absolute deadline for the SAME ticket+generation.
+    std::uint64_t v07_watch_ticket = 0;
+    std::uint64_t v07_watch_generation = 0;
+    Clock::time_point v07_watchdog_deadline{};
+    std::uint64_t v07_ticks = 0;
+    std::uint64_t v07_wakes = 0;
+    std::uint64_t v07_queue_deadlines = 0;
+    std::uint64_t v07_watchdogs = 0;
+    std::optional<ninfer::CudaCompletionNotifier::ThreadScope> gpu_subscription;
+    if (event_dispatch) gpu_subscription.emplace(gpu_wake_);
+    std::fprintf(stderr, "[ninfer-poll-experiment] sleep_us=%u event_dispatch=%u "
+                         "event_fallback_us=50\n", poll_sleep_us,
+                 event_dispatch ? 1U : 0U);
+    // Diagnostic only: classify what the following scheduling pass achieved
+    // after a GPU/queue signal versus a fallback timeout.
+    enum class LastWait { None, Signaled, Timeout };
+    LastWait last_wait = LastWait::None;
     std::uint64_t scheduled_revision = 0;
     for (;;) {
         {
@@ -1151,11 +1213,94 @@ void EngineCore<Instance>::worker_loop() noexcept {
                 lock.unlock();
                 fail_all(std::make_exception_ptr(RequestError(
                     RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                if (event_dispatch) {
+                    std::fprintf(stderr,
+                        "[ninfer-event-dispatch] gpu=%llu queue=%llu wakes=%llu "
+                        "timeouts=%llu callback_failures=%llu\n",
+                        static_cast<unsigned long long>(gpu_wake_->gpu_signals.load()),
+                        static_cast<unsigned long long>(gpu_wake_->queue_signals.load()),
+                        static_cast<unsigned long long>(gpu_wake_->wait_wakes.load()),
+                        static_cast<unsigned long long>(gpu_wake_->wait_timeouts.load()),
+                        static_cast<unsigned long long>(gpu_wake_->callback_failures.load()));
+                    const auto count = [](const std::atomic<std::uint64_t>& value) {
+                        return static_cast<unsigned long long>(
+                            value.load(std::memory_order_relaxed));
+                    };
+                    std::fprintf(stderr,
+                        "[ninfer-event-diagnosis] timeout_idle=%llu timeout_poll=%llu "
+                        "timeout_cycle=%llu signal_idle=%llu signal_poll=%llu signal_cycle=%llu\n",
+                        count(gpu_wake_->timeout_idle),
+                        count(gpu_wake_->timeout_poll_progress),
+                        count(gpu_wake_->timeout_cycle_progress),
+                        count(gpu_wake_->signal_idle),
+                        count(gpu_wake_->signal_poll_progress),
+                        count(gpu_wake_->signal_cycle_progress));
+                    std::fprintf(stderr,
+                        "[ninfer-event-v04] admitted=%llu signaled=%llu watchdog=%llu "
+                        "uncovered=%llu already_delivered=%llu\n",
+                        count(gpu_wake_->dense_v04_admitted),
+                        count(gpu_wake_->dense_v04_signaled),
+                        count(gpu_wake_->dense_v04_watchdog),
+                        count(gpu_wake_->dense_v04_uncovered),
+                        count(gpu_wake_->dense_v04_already_delivered));
+                    std::fprintf(stderr,
+                        "[ninfer-event-v06-notify] streams=%llu create_errors=%llu "
+                        "capacity_fallbacks=%llu waits=%llu wait_errors=%llu "
+                        "callbacks=%llu sync_errors=%llu destroy_errors=%llu "
+                        "callback_cpu_total_us=%.3f callback_cpu_max_us=%.3f\n",
+                        count(gpu_wake_->notify_stream_created),
+                        count(gpu_wake_->notify_stream_create_errors),
+                        count(gpu_wake_->notify_stream_capacity_fallbacks),
+                        count(gpu_wake_->notify_wait_submitted),
+                        count(gpu_wake_->notify_wait_errors),
+                        count(gpu_wake_->notify_callback_submitted),
+                        count(gpu_wake_->notify_sync_errors),
+                        count(gpu_wake_->notify_destroy_errors),
+                        double(count(gpu_wake_->callback_cpu_ns_total)) / 1000.0,
+                        double(count(gpu_wake_->callback_cpu_ns_max)) / 1000.0);
+                    if (dense_v07_tick_us != 0)
+                        std::fprintf(stderr,
+                            "[ninfer-event-v07] tick_us=%u waits=%llu signals=%llu "
+                            "ticks=%llu queue_deadlines=%llu watchdogs=%llu\n",
+                            dense_v07_tick_us,
+                            count(gpu_wake_->dense_v04_admitted),
+                            static_cast<unsigned long long>(v07_wakes),
+                            static_cast<unsigned long long>(v07_ticks),
+                            static_cast<unsigned long long>(v07_queue_deadlines),
+                            static_cast<unsigned long long>(v07_watchdogs));
+                    std::fprintf(stderr,
+                        "[ninfer-event-gate] pending=%llu guarded_waits=%llu "
+                        "guarded_timeouts=%llu fallback_waits=%llu\n",
+                        count(gpu_wake_->callbacks_pending),
+                        count(gpu_wake_->guarded_waits),
+                        count(gpu_wake_->guarded_timeouts),
+                        count(gpu_wake_->fallback_waits));
+                    std::fprintf(stderr,
+                        "[ninfer-event-coverage] record=%llu enqueued=%llu capture_skips=%llu "
+                        "capture_errors=%llu ready_not_ready=%llu ready_success=%llu "
+                        "graph_start_wait=%llu graph_poll_wait=%llu "
+                        "moe_post_wait=%llu moe_layer_wait=%llu moe_launch_wait=%llu\n",
+                        count(gpu_wake_->completion_record_attempts),
+                        count(gpu_wake_->completion_callbacks_enqueued),
+                        count(gpu_wake_->completion_capture_skips),
+                        count(gpu_wake_->completion_capture_query_errors),
+                        count(gpu_wake_->completion_ready_not_ready),
+                        count(gpu_wake_->completion_ready_success),
+                        count(gpu_wake_->qwen_graph_start_waits),
+                        count(gpu_wake_->qwen_graph_poll_waits),
+                        count(gpu_wake_->qwen_moe_post_waits),
+                        count(gpu_wake_->qwen_moe_layer_waits),
+                        count(gpu_wake_->qwen_moe_launch_waits));
+                }
                 return;
             }
         }
+        // Snapshot BEFORE polling: callback between poll and wait cannot be lost.
+        const auto wake_before = event_dispatch ? gpu_wake_->snapshot() : 0;
         bool progressed  = false;
         bool outstanding = false;
+        bool polled_progress = false;
+        bool advanced_progress = false;
         try {
             if (compute_) {
                 set_host_work_class(compute_->kind == UnitKind::Decode    ? HostWorkClass::Decode
@@ -1167,6 +1312,7 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             auto boundary = begin_host_phase();
             progressed    = poll_execution(boundary);
+            polled_progress = progressed;
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             const auto revision = schedule_revision_.load(std::memory_order_acquire);
             if (revision != published_revision_) publish_runtime_stats();
@@ -1181,6 +1327,7 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             if (advance_cycle()) {
                 progressed = true;
+                advanced_progress = true;
                 publish_runtime_stats();
             }
             {
@@ -1195,10 +1342,205 @@ void EngineCore<Instance>::worker_loop() noexcept {
             fail_all(std::current_exception());
             return;
         }
+        if (event_dispatch && last_wait != LastWait::None) {
+            // The *next* completed pass tells whether the last wait was useful.
+            // This is diagnostic bookkeeping, not a scheduling decision.
+            if (last_wait == LastWait::Timeout) {
+                if (polled_progress)
+                    gpu_wake_->timeout_poll_progress.fetch_add(1, std::memory_order_relaxed);
+                else if (advanced_progress)
+                    gpu_wake_->timeout_cycle_progress.fetch_add(1, std::memory_order_relaxed);
+                else
+                    gpu_wake_->timeout_idle.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (polled_progress)
+                    gpu_wake_->signal_poll_progress.fetch_add(1, std::memory_order_relaxed);
+                else if (advanced_progress)
+                    gpu_wake_->signal_cycle_progress.fetch_add(1, std::memory_order_relaxed);
+                else
+                    gpu_wake_->signal_idle.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        last_wait = LastWait::None;
         if (outstanding) {
             const auto exposed = active_exposure_set();
             const auto started = Clock::now();
-            std::this_thread::yield();
+            // Never delay the worker when it just handled an event or submitted work.
+            // A new request can still arrive during this short idle polling interval.
+            if (event_dispatch && !progressed) {
+                // GPU callbacks and queued requests wake this wait. The 50us
+                // fallback prevents stalls on graph-captured and intermediate
+                // MoE transitions that do not issue a host callback.
+                // Experimental step towards an explicit wakeup contract:
+                // extend the wait ONLY while a CUDA callback is currently
+                // outstanding AND no observed graph/MoE/capture path needs an
+                // unsignalled CPU step. This is NOT sufficient proof of coverage
+                // for every model. A bounded watchdog remains for liveness.
+                const bool unknown_progress =
+                    gpu_wake_->callback_failures.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->completion_capture_skips.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->completion_capture_query_errors.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->qwen_graph_start_waits.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->qwen_graph_poll_waits.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->qwen_moe_post_waits.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->qwen_moe_layer_waits.load(std::memory_order_relaxed) != 0 ||
+                    gpu_wake_->qwen_moe_launch_waits.load(std::memory_order_relaxed) != 0;
+                // v0.4: The program itself publishes the current Qwen Dense
+                // ticket/stage/generation. A global callback count is NOT a
+                // safe condition for an indefinite or long wait.
+                const auto dense_state = dense_v04 ? gpu_wake_->snapshot_dense_state()
+                    : ninfer::CudaCompletionNotifier::State::DenseWaitSnapshot{};
+                const auto& contract = dense_state.contract;
+                const bool covered = contract && contract->ticket != 0 &&
+                    contract->completion && contract->completion->generation != 0 &&
+                    !unknown_progress;
+                const bool delivered = covered &&
+                    contract->completion->delivered.load(std::memory_order_acquire);
+                const bool first_delivery = delivered &&
+                    contract->completion->generation != delivered_retry_generation;
+                bool signaled = false;
+                bool immediate_retry = false;
+                if (covered && !delivered) {
+                    gpu_wake_->dense_v04_admitted.fetch_add(1, std::memory_order_relaxed);
+                    gpu_wake_->dense_v04_last_ticket.store(contract->ticket,
+                                                          std::memory_order_relaxed);
+                    gpu_wake_->dense_v04_last_generation.store(
+                        contract->completion->generation, std::memory_order_relaxed);
+                    switch (contract->stage) {
+                    case ninfer::CudaCompletionNotifier::State::DenseStage::ContextReady:
+                        gpu_wake_->dense_v04_context.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case ninfer::CudaCompletionNotifier::State::DenseStage::History:
+                        gpu_wake_->dense_v04_history.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case ninfer::CudaCompletionNotifier::State::DenseStage::Readback:
+                        gpu_wake_->dense_v04_readback.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case ninfer::CudaCompletionNotifier::State::DenseStage::DeviceRetired:
+                        gpu_wake_->dense_v04_retired.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    // The 1-second bound is ONLY for asynchronous CUDA failure
+                    // recovery. Successful callbacks and queue signals wake
+                    // immediately. Queue deadlines may shorten this bound.
+                    if (dense_v07_tick_us == 0) {
+                        // Exact v0.4 behavior, including its original diagnostics.
+                        const auto watchdog = Clock::now() + std::chrono::seconds(1);
+                        const auto deadline = std::min(watchdog, pending_deadline_);
+                        signaled = gpu_wake_->wait_dense_change(
+                            wake_before, contract->completion, deadline);
+                        if (signaled)
+                            gpu_wake_->dense_v04_signaled.fetch_add(
+                                1, std::memory_order_relaxed);
+                        else
+                            gpu_wake_->dense_v04_watchdog.fetch_add(
+                                1, std::memory_order_relaxed);
+                    } else {
+                        const auto now = Clock::now();
+                        const auto ticket = contract->ticket;
+                        const auto completion_generation = contract->completion->generation;
+                        if (ticket != v07_watch_ticket ||
+                            completion_generation != v07_watch_generation ||
+                            v07_watchdog_deadline == Clock::time_point{}) {
+                            v07_watch_ticket = ticket;
+                            v07_watch_generation = completion_generation;
+                            v07_watchdog_deadline = now + std::chrono::seconds(1);
+                        }
+                        const auto full_deadline =
+                            std::min(v07_watchdog_deadline, pending_deadline_);
+                        const auto tick_deadline = std::min(
+                            full_deadline,
+                            now + std::chrono::microseconds(dense_v07_tick_us));
+                        // The same generation/wake predicate as v0.4; only the
+                        // maximum blocking interval is shorter. Returning false
+                        // lets the *existing* poll_execution re-check CUDA state.
+                        signaled = gpu_wake_->wait_dense_change(
+                            wake_before, contract->completion, tick_deadline);
+                        if (signaled) {
+                            ++v07_wakes;
+                            gpu_wake_->dense_v04_signaled.fetch_add(
+                                1, std::memory_order_relaxed);
+                        } else if (tick_deadline < full_deadline) {
+                            // Routine progress probe, NOT a CUDA failure watchdog.
+                            ++v07_ticks;
+                        } else if (full_deadline == v07_watchdog_deadline) {
+                            ++v07_watchdogs;
+                            gpu_wake_->dense_v04_watchdog.fetch_add(
+                                1, std::memory_order_relaxed);
+                            // Preserve bounded recovery and avoid a tight loop if
+                            // a callback genuinely never arrives.
+                            v07_watchdog_deadline = Clock::now() +
+                                std::chrono::seconds(1);
+                        } else {
+                            // Existing request/queue scheduling deadline.
+                            ++v07_queue_deadlines;
+                        }
+                    }
+                } else if (dense_v04 && first_delivery) {
+                    // One immediate re-poll per delivered generation. If the
+                    // stage remains stuck, fall back instead of busy-spinning.
+                    delivered_retry_generation = contract->completion->generation;
+                    gpu_wake_->dense_v04_already_delivered.fetch_add(
+                        1, std::memory_order_relaxed);
+                    immediate_retry = true;
+                } else {
+                    if (dense_v04) {
+                        const auto index = gpu_wake_->dense_v04_uncovered.fetch_add(
+                            1, std::memory_order_relaxed);
+                        // A few lines per process, only on actual fallback entries.
+                        // No CUDA calls or state-machine mutations in this audit.
+                        if (index < 32) {
+                            using Gap = ninfer::CudaCompletionNotifier::State::DenseGapReason;
+                            const char* reason = "none";
+                            switch (dense_state.reason) {
+                            case Gap::None: reason = "none"; break;
+                            case Gap::Ineligible: reason = "ineligible"; break;
+                            case Gap::ConcurrentFrames: reason = "concurrent_frames"; break;
+                            case Gap::Idle: reason = "idle"; break;
+                            case Gap::UnsupportedStage: reason = "unsupported_stage"; break;
+                            case Gap::MissingGeneration: reason = "missing_generation"; break;
+                            }
+                            // A present but unusable contract may still explain the fallback.
+                            if (unknown_progress) reason = "unknown_progress";
+                            else if (contract && covered && delivered && !first_delivery)
+                                reason = "already_delivered_generation";
+                            std::fprintf(stderr,
+                                "[ninfer-event-gap] index=%llu reason=%s stage=%u "
+                                "contract=%d covered=%d delivered=%d unknown=%d "
+                                "engine_compute=%d engine_retiring=%d "
+                                "engine_context=%d outstanding=%d\n",
+                                static_cast<unsigned long long>(index + 1), reason,
+                                dense_state.compute_stage, int(bool(contract)), int(covered),
+                                int(delivered), int(unknown_progress), int(bool(compute_)),
+                                int(bool(retiring_)),
+                                int(instance_.session->has_context_operation()),
+                                int(outstanding));
+                        }
+                    }
+                    // Legacy bounded fallback remains for CPU/Graph/MoE stages
+                    // with no complete callback contract.
+                    const bool callback_pending =
+                        gpu_wake_->callbacks_pending.load(std::memory_order_acquire) != 0;
+                    const bool guarded = !dense_v04 && guarded_wait &&
+                                         callback_pending && !unknown_progress;
+                    if (guarded)
+                        gpu_wake_->guarded_waits.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        gpu_wake_->fallback_waits.fetch_add(1, std::memory_order_relaxed);
+                    const auto bound = guarded ? std::chrono::microseconds(5000)
+                                               : std::chrono::microseconds(50);
+                    signaled = gpu_wake_->wait_change(wake_before, bound);
+                    if (guarded && !signaled)
+                        gpu_wake_->guarded_timeouts.fetch_add(1, std::memory_order_relaxed);
+                }
+                last_wait = immediate_retry || signaled
+                                ? LastWait::Signaled : LastWait::Timeout;
+            } else if (poll_sleep_us && !progressed) {
+                std::this_thread::sleep_for(std::chrono::microseconds(poll_sleep_us));
+            } else {
+                std::this_thread::yield();
+            }
+            // Existing Yield telemetry includes experiment sleep time.
             record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
                                     exposed);
         }

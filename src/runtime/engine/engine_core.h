@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/nvtx.h"
+#include "core/cuda_completion_notifier.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -127,6 +128,7 @@ public:
             stopping_ = true;
         }
         queue_cv_.notify_all();
+        gpu_wake_->notify_queue();
     }
 
     EngineCore(const EngineCore&)            = delete;
@@ -271,6 +273,7 @@ public:
                 --outstanding_;
             }
             queue_cv_.notify_all();
+            gpu_wake_->notify_queue();
             throw;
         }
 
@@ -287,6 +290,7 @@ public:
         }
         request_admission_check();
         queue_cv_.notify_one();
+        gpu_wake_->notify_queue();
         return Submission(*this, std::move(request));
     }
 
@@ -313,6 +317,7 @@ public:
             measurement_ = std::move(request);
         }
         queue_cv_.notify_all();
+        gpu_wake_->notify_queue();
         return result.get();
     }
 
@@ -663,6 +668,8 @@ private:
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
+    std::shared_ptr<ninfer::CudaCompletionNotifier::State> gpu_wake_ =
+        std::make_shared<ninfer::CudaCompletionNotifier::State>();
     std::deque<std::shared_ptr<Request>> pending_;
     std::unique_ptr<MeasurementRequest> measurement_;
     std::size_t preparing_requests_       = 0;

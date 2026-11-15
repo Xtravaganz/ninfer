@@ -715,6 +715,7 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     for (const auto& request : pending) { publish(request); }
     if (measurement) measurement->completion.set_exception(error);
     queue_cv_.notify_all();
+    gpu_wake_->notify_queue();
 }
 
 } // namespace ninfer::runtime
